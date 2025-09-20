@@ -1,18 +1,15 @@
-# app.py — Outf!ts
-# 追加:
-# - 写真アップ時に「色・カテゴリ・名前・素材・得意シーズン」をヒューリスティックで自動推定して初期入力
-# - URL取込の文字化けを修正（多段エンコード検出 + BeautifulSoup + HTMLアンエスケープ）
-# - URLからも「カテゴリ/素材/得意シーズン」をテキスト分析で推定
-# - 既存機能（AIコーデ/評価/編集 等）は前版を踏襲
+# app.py — Outf!ts (no-bs4)
+# - BeautifulSoup 依存を削除（ModuleNotFoundError回避）
+# - URL取込は正規表現＋JSON-LDでタイトル/画像を取得、文字化けを自動補正
+# - 写真アップ時：色/カテゴリ/素材/得意シーズン/名前を自動推定
+# - AIコーデ（体感/空気/雨）・評価・編集 などはそのまま
 
 import streamlit as st
 import pandas as pd, numpy as np
 from PIL import Image, ImageDraw
-import sqlite3, os, io, requests, colorsys, calendar, json, re
+import sqlite3, os, io, requests, colorsys, calendar, json, re, html as ihtml
 from urllib.parse import urljoin
 from datetime import datetime
-from bs4 import BeautifulSoup
-import html as ihtml  # HTMLエンティティ解除
 
 st.set_page_config(page_title="Outf!ts", layout="centered")
 
@@ -322,29 +319,37 @@ def generate_outfit_from_closet(all_items, season, body_shape, want, heat, humid
     total_score = t_score + b_sc + s_sc + g_sc
     return {"top":top,"bottom":bottom,"shoes":shoes,"bag":bag}, total_score
 
-# ---------- URL取込（エンコード対策 + 推定器） ----------
+# ---------- URL取込（正規表現＋JSON-LD） ----------
 UA = {"User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1","Accept-Language":"ja,en;q=0.8"}
 
 def _decode_best(r):
-    """文字化け対策: 応答バイトから最適なエンコーディングで文字列化"""
     b = r.content
-    candidates = []
-    if getattr(r, "encoding", None): candidates.append(r.encoding)
-    if getattr(r, "apparent_encoding", None): candidates.append(r.apparent_encoding)
-    candidates += ["utf-8","cp932","shift_jis","euc-jp"]
-    for enc in candidates:
-        try: return b.decode(enc)
+    cands = []
+    if getattr(r, "encoding", None): cands.append(r.encoding)
+    if getattr(r, "apparent_encoding", None): cands.append(r.apparent_encoding)
+    cands += ["utf-8","cp932","shift_jis","euc-jp"]
+    for enc in cands:
+        try:
+            s = b.decode(enc)
+            # 典型的なモジバケ（Ã, Â）があれば latin-1→utf-8 再変換を試行
+            if "Ã" in s or "Â" in s:
+                try:
+                    s2 = s.encode("latin-1","ignore").decode("utf-8","ignore")
+                    if len(s2.replace("�","")) > len(s.replace("�","")):
+                        s = s2
+                except: pass
+            return s
         except: continue
     return b.decode("utf-8", errors="ignore")
 
-def _meta(soup, key):
-    tag = soup.find("meta", attrs={"property":key}) or soup.find("meta", attrs={"name":key})
-    return tag.get("content").strip() if tag and tag.get("content") else None
+def _meta(content, name):
+    m=re.search(rf'<meta[^>]+(?:property|name)=["\']{re.escape(name)}["\'][^>]+content=["\']([^"\']+)["\']', content, re.I)
+    return ihtml.unescape(m.group(1)) if m else None
 
-def _jsonld_image(soup):
-    for sc in soup.find_all("script", {"type":"application/ld+json"}):
+def _jsonld_image(content):
+    for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', content, re.I|re.S):
         try:
-            data=json.loads(sc.string)
+            data=json.loads(m.group(1))
             if isinstance(data, list):
                 for d in data:
                     if isinstance(d, dict) and d.get("image"):
@@ -353,6 +358,35 @@ def _jsonld_image(soup):
                 img=data["image"]; return img[0] if isinstance(img, list) else img
         except: pass
     return None
+
+def fetch_from_page(url:str):
+    """(title, image_bytes, description) を返す"""
+    try:
+        r=requests.get(url, timeout=10, headers=UA)
+        if r.status_code!=200: return None,None,None
+        html=_decode_best(r)
+
+        title = _meta(html,"og:title") or _meta(html,"twitter:title")
+        if not title:
+            t2=re.search(r'<title[^>]*>(.*?)</title>', html, re.I|re.S)
+            title=ihtml.unescape(t2.group(1).strip()) if t2 else None
+
+        desc  = _meta(html,"og:description") or _meta(html,"description")
+
+        img_url = _meta(html,"og:image:secure_url") or _meta(html,"og:image") or _meta(html,"twitter:image")
+        if not img_url: img_url = _jsonld_image(html)
+        if img_url: img_url=urljoin(url, img_url)
+
+        img_bytes=None
+        if img_url:
+            try:
+                r2=requests.get(img_url, timeout=10, headers=UA)
+                if r2.status_code==200: img_bytes=r2.content
+            except: pass
+
+        return title, img_bytes, desc
+    except:
+        return None, None, None
 
 # ---- テキストからカテゴリ/素材/季節を推定 ----
 CAT_MAP = {
@@ -365,49 +399,21 @@ CAT_MAP = {
     "アクセ":["帽子","キャップ","ハット","ベルト","マフラー","ストール","アクセ","ネックレス","ピアス","cap","hat","scarf","belt","accessory"]
 }
 MAT_KEYS = ["コットン","綿","ウール","ナイロン","ポリエステル","リネン","麻","デニム","レザー","合皮","カシミヤ","シルク","ダウン","フリース"]
-
 def guess_category_from_text(text:str)->str:
     t=(text or "").lower()
-    score=[]
     for cat, kws in CAT_MAP.items():
-        if any(k.lower() in t for k in kws): score.append((cat,1))
-    if score: return score[0][0]
+        if any(k.lower() in t for k in kws): return cat
     return "トップス"
-
 def guess_material_from_text(text:str)->str|None:
     t=text or ""
     for k in MAT_KEYS:
         if k in t: return k
     return None
-
 def guess_season_from_text(text:str)->str|None:
     t=(text or "").lower()
     if any(k in t for k in ["春夏","ss","summer","春/夏"]): return "summer"
     if any(k in t for k in ["秋冬","fw","winter","秋/冬"]): return "winter"
     return None
-
-def fetch_from_page(url:str):
-    """商品ページURLから (title, image_bytes, description) を取得（UNIQLO/ZOZO等）"""
-    try:
-        r=requests.get(url, timeout=10, headers=UA)
-        if r.status_code!=200: return None,None,None
-        html=_decode_best(r)
-        soup=BeautifulSoup(html, "html.parser")
-        title = _meta(soup,"og:title") or _meta(soup,"twitter:title") or (soup.title.get_text().strip() if soup.title else None)
-        desc  = _meta(soup,"og:description") or _meta(soup,"description")
-        if title: title = ihtml.unescape(title)
-        img_url = _meta(soup,"og:image:secure_url") or _meta(soup,"og:image") or _meta(soup,"twitter:image")
-        if not img_url: img_url = _jsonld_image(soup)
-        if img_url: img_url=urljoin(url, img_url)
-        img_bytes=None
-        if img_url:
-            try:
-                r2=requests.get(img_url, timeout=10, headers=UA)
-                if r2.status_code==200: img_bytes=r2.content
-            except: pass
-        return title, img_bytes, desc
-    except:
-        return None, None, None
 
 # ---------- 画像からの簡易推定 ----------
 def pick_top_bottom_from_colors(cols:list[str]):
@@ -417,7 +423,6 @@ def pick_top_bottom_from_colors(cols:list[str]):
     top = vivid[0] if vivid else (cols[0] if cols else "#2f2f2f")
     if top == bottom: bottom = "#c9c9c9"
     return top, bottom
-
 def guess_season_from_colors(cols:list[str])->str|None:
     if not cols: return None
     hsv=[]
@@ -433,15 +438,11 @@ def guess_season_from_colors(cols:list[str])->str|None:
     if v<0.55 and 20<=hue<=80:              return "autumn"
     if v>0.8 and s>0.6 and (hue<20 or hue>220): return "winter"
     return None
-
 def guess_category_from_image(img:Image.Image)->str:
     ar = img.height / max(1,img.width)
-    if ar>=1.4:  # 縦長→ワンピ/ボトム推定
-        return "ボトムス"
-    if ar<=0.9:  # 横長→トップス/アウター
-        return "トップス"
+    if ar>=1.4:  return "ボトムス"
+    if ar<=0.9:  return "トップス"
     return "トップス"
-
 def guess_material_from_colors(cols:list[str])->str:
     if not cols: return "コットン"
     v = np.mean([hex_luma(x) for x in cols])
@@ -544,7 +545,6 @@ with tabCloset:
     if add_mode=="写真から":
         colC = st.columns(2)
         upi = st.file_uploader("画像", type=["jpg","jpeg","png","webp"], key="cl_img")
-        # --- 自動推定 ---
         color_auto="#2f2f2f"; cat_guess="トップス"; season_guess=None; name_suggest="アイテム"; material_guess="コットン"
         if upi:
             img_i = Image.open(upi).convert("RGB")
@@ -556,7 +556,7 @@ with tabCloset:
             cname = JP_COLOR.get(nearest_css_name(color_auto), "カラー")
             name_suggest = f"{cname} {('Tシャツ' if cat_guess=='トップス' else 'パンツ' if cat_guess=='ボトムス' else cat_guess)}"
             material_guess = guess_material_from_colors(cols_auto)
-            st.caption("自動カラー/カテゴリ/季節/素材を推定しました（必要に応じて修正）")
+            st.caption("自動カラー/カテゴリ/季節/素材を推定（必要なら修正）")
             st.markdown(" ".join([f"<span class='swatch' style='background:{h}'></span>" for h in cols_auto]), unsafe_allow_html=True)
 
         colN = st.columns(2)
@@ -594,7 +594,6 @@ with tabCloset:
         img_bytes = st.session_state.get("url_img")
         desc = st.session_state.get("url_desc","")
 
-        # --- 推定（文字から） ---
         cat_from_text = guess_category_from_text((title or "") + " " + (desc or ""))
         mat_from_text = guess_material_from_text((title or "") + " " + (desc or "")) or ""
         ssn_from_text = guess_season_from_text((title or "") + " " + (desc or ""))
@@ -608,7 +607,7 @@ with tabCloset:
             st.markdown(" ".join([f"<span class='swatch' style='background:{h}'></span>" for h in cols_auto]), unsafe_allow_html=True)
 
         colU = st.columns(2)
-        name_url = colU[0].text_input("名前", value=(title or ""), key="cl_name_url")  # ← 文字化け対策済タイトル
+        name_url = colU[0].text_input("名前", value=(title or ""), key="cl_name_url")
         category_url = colU[1].selectbox("カテゴリ", ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"],
                                          index=(["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"].index(cat_from_text) if cat_from_text in ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"] else 0),
                                          key="cl_category_url")
