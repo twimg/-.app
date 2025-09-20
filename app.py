@@ -1,9 +1,9 @@
 # app.py — Outf!ts
-# 変更点:
-# - 写真アップ時に自動カラー認識→トップ/ボトム色へ自動反映（手動へ切替も可）
-# - アプリ名を "Outf!ts" に統一（余計な文言は省略）
-# - 背景をアパレル系カラー（ベージュ×チャコールの柔らかいグラデ）
-# - AIコーデの環境入力を「体感/空気/雨」に変更（湿度考慮の素材優先）
+# 追加:
+# - 写真アップ時に「色・カテゴリ・名前・素材・得意シーズン」をヒューリスティックで自動推定して初期入力
+# - URL取込の文字化けを修正（多段エンコード検出 + BeautifulSoup + HTMLアンエスケープ）
+# - URLからも「カテゴリ/素材/得意シーズン」をテキスト分析で推定
+# - 既存機能（AIコーデ/評価/編集 等）は前版を踏襲
 
 import streamlit as st
 import pandas as pd, numpy as np
@@ -11,40 +11,25 @@ from PIL import Image, ImageDraw
 import sqlite3, os, io, requests, colorsys, calendar, json, re
 from urllib.parse import urljoin
 from datetime import datetime
+from bs4 import BeautifulSoup
+import html as ihtml  # HTMLエンティティ解除
 
 st.set_page_config(page_title="Outf!ts", layout="centered")
 
-# ---------- Apparel-like Theme ----------
+# ---------- Theme ----------
 st.markdown("""
 <style>
-:root{
-  --bg-a:#f6f1e7;   /* warm beige */
-  --bg-b:#ece7df;
-  --ink:#222;
-  --accent:#1f7a7a; /* muted teal */
-}
-html, body {
-  background: linear-gradient(135deg, var(--bg-a), var(--bg-b));
-}
-.block-container{
-  background: #ffffffcc;
-  backdrop-filter: blur(4px);
-  border: 1px solid #eee;
-  border-radius: 16px;
-  padding: 18px 16px 30px;
-}
-.stTabs [role="tab"]{
-  padding:12px 10px; border-radius:10px; font-weight:600;
-}
-.stTabs [role="tab"][aria-selected="true"]{
-  background:#fff; border:1px solid #ddd;
-}
-button[kind="primary"]{
-  background: var(--accent) !important; border:0 !important;
-}
-.card {border:1px solid #eee; border-radius:12px; padding:10px; margin:8px 0; background:#fff;}
+:root{ --bg-a:#f6f1e7; --bg-b:#ece7df; --ink:#222; --accent:#1f7a7a; }
+html, body { background: linear-gradient(135deg, var(--bg-a), var(--bg-b)); }
+.block-container{ background:#ffffffcc; backdrop-filter: blur(4px); border:1px solid #eee;
+  border-radius:16px; padding:18px 16px 30px; }
+.stTabs [role="tab"]{ padding:12px 10px; border-radius:10px; font-weight:600; }
+.stTabs [role="tab"][aria-selected="true"]{ background:#fff; border:1px solid #ddd; }
+button[kind="primary"]{ background: var(--accent) !important; border:0 !important; }
+.card{border:1px solid #eee;border-radius:12px;padding:10px;margin:8px 0;background:#fff;}
 .badge{display:inline-block;padding:6px 10px;border-radius:999px;border:1px solid #ddd;margin-right:6px;}
 .swatch{width:24px;height:24px;border:1px solid #aaa;border-radius:6px;display:inline-block;margin-right:6px;}
+.small{font-size:12px;color:#666}
 </style>
 """, unsafe_allow_html=True)
 
@@ -91,7 +76,6 @@ def init_db():
           top_id INTEGER, bottom_id INTEGER, shoes_id INTEGER, bag_id INTEGER,
           ctx TEXT, score REAL, rating INTEGER
         )""")
-        # 後方互換 ALTER
         try: c.execute("ALTER TABLE profile ADD COLUMN body_shape TEXT")
         except: pass
         try: c.execute("ALTER TABLE profile ADD COLUMN height_cm REAL")
@@ -187,16 +171,26 @@ CSS_COLORS = {
  "Pink":"#ffc0cb","HotPink":"#ff69b4","Magenta":"#ff00ff","Purple":"#800080","Indigo":"#4b0082",
  "Lavender":"#e6e6fa","Plum":"#dda0dd","Brown":"#a52a2a","Chocolate":"#d2691e","SaddleBrown":"#8b4513"
 }
+JP_COLOR = {"Black":"ブラック","White":"ホワイト","Gray":"グレー","Silver":"シルバー","DimGray":"ダークグレー",
+"Navy":"ネイビー","MidnightBlue":"ミッドナイトブルー","RoyalBlue":"ロイヤルブルー","Blue":"ブルー","DodgerBlue":"ドッジャーブルー",
+"LightBlue":"ライトブルー","Teal":"ティール","Aqua":"アクア","Turquoise":"ターコイズ",
+"Green":"グリーン","Lime":"ライム","Olive":"オリーブ","ForestGreen":"フォレストグリーン","SeaGreen":"シーグリーン",
+"Yellow":"イエロー","Gold":"ゴールド","Khaki":"カーキ","Beige":"ベージュ","Tan":"タン",
+"Orange":"オレンジ","Coral":"コーラル","Tomato":"トマト","Red":"レッド","Maroon":"マルーン",
+"Pink":"ピンク","HotPink":"ホットピンク","Magenta":"マゼンタ","Purple":"パープル","Indigo":"インディゴ",
+"Lavender":"ラベンダー","Plum":"プラム","Brown":"ブラウン","Chocolate":"チョコレート","SaddleBrown":"サドルブラウン"}
+
 def hex_to_rgb(h): h=h.lstrip("#"); return tuple(int(h[i:i+2],16) for i in (0,2,4))
 def rgb_to_hex(rgb): return "#{:02x}{:02x}{:02x}".format(*rgb)
-def hex_luma(h):
-    r,g,b=hex_to_rgb(h); return 0.2126*r+0.7152*g+0.0722*b  # 明度推定
+def hex_luma(h): r,g,b=hex_to_rgb(h); return 0.2126*r+0.7152*g+0.0722*b
+
 def nearest_css_name(hexstr):
     r,g,b = hex_to_rgb(hexstr); best,bd=None,10**9
     for name,hx in CSS_COLORS.items():
         rr,gg,bb = hex_to_rgb(hx); d=(r-rr)**2+(g-gg)**2+(b-bb)**2
         if d<bd: bd, best=d, name
     return best
+
 def hex_family(hx):
     r,g,b=[v/255 for v in hex_to_rgb(hx)]
     h,s,v=colorsys.rgb_to_hsv(r,g,b); hue=h*360
@@ -212,6 +206,7 @@ def hex_family(hx):
     if 255<=hue<290: return "purple"
     if 290<=hue<330: return "magenta"
     return "red"
+
 def adjust_harmony(hx, mode="complement", delta=30):
     r,g,b=[v/255 for v in hex_to_rgb(hx)]
     h,s,v=colorsys.rgb_to_hsv(r,g,b)
@@ -221,6 +216,7 @@ def adjust_harmony(hx, mode="complement", delta=30):
     for hh in hs:
         rr,gg,bb=colorsys.hsv_to_rgb(hh,s,v); outs.append(rgb_to_hex((int(rr*255),int(gg*255),int(bb*255))))
     return outs
+
 def extract_dominant_colors(img:Image.Image, k=5):
     small=img.copy(); small.thumbnail((200,200))
     pal=small.convert("P", palette=Image.ADAPTIVE, colors=k)
@@ -250,7 +246,7 @@ def palette_distance(hexstr, user_season):
         if d<best: best=d
     return best
 
-# ---------- Weather-like scoring helpers ----------
+# ---------- 環境考慮（AIコーデ用） ----------
 def purpose_match(notes:str, want:str)->int:
     if not want or want=="指定なし": return 0
     n=notes or ""
@@ -277,7 +273,6 @@ def body_shape_bonus(notes:str, body:str|None, category:str)->int:
     return 0
 
 def climate_bonus(material:str|None, heat:str, humidity:str, rainy:bool)->int:
-    """heat: 寒い/涼しい/ちょうど/暑い/猛暑, humidity: 乾燥/普通/湿度高い"""
     m=(material or "").lower()
     s=0
     if heat in ["暑い","猛暑"] and any(k in m for k in ["linen","リネン","cotton","コットン","メッシュ","ドライ"]): s+=1
@@ -327,46 +322,132 @@ def generate_outfit_from_closet(all_items, season, body_shape, want, heat, humid
     total_score = t_score + b_sc + s_sc + g_sc
     return {"top":top,"bottom":bottom,"shoes":shoes,"bag":bag}, total_score
 
-# ---------- URL 取り込み（UNIQLO/ZOZOなど） ----------
+# ---------- URL取込（エンコード対策 + 推定器） ----------
 UA = {"User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1","Accept-Language":"ja,en;q=0.8"}
-def fetch_image_bytes_from_url(url:str):
-    try:
-        r=requests.get(url, timeout=10, headers=UA)
-        if r.status_code==200: return r.content
-    except: return None
-    return None
-def _meta(content, name):
-    m=re.search(rf'<meta[^>]+(?:property|name)=["\']{re.escape(name)}["\'][^>]+content=["\']([^"\']+)["\']', content, re.I)
-    return m.group(1) if m else None
-def _jsonld_image(content):
-    for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', content, re.I|re.S):
+
+def _decode_best(r):
+    """文字化け対策: 応答バイトから最適なエンコーディングで文字列化"""
+    b = r.content
+    candidates = []
+    if getattr(r, "encoding", None): candidates.append(r.encoding)
+    if getattr(r, "apparent_encoding", None): candidates.append(r.apparent_encoding)
+    candidates += ["utf-8","cp932","shift_jis","euc-jp"]
+    for enc in candidates:
+        try: return b.decode(enc)
+        except: continue
+    return b.decode("utf-8", errors="ignore")
+
+def _meta(soup, key):
+    tag = soup.find("meta", attrs={"property":key}) or soup.find("meta", attrs={"name":key})
+    return tag.get("content").strip() if tag and tag.get("content") else None
+
+def _jsonld_image(soup):
+    for sc in soup.find_all("script", {"type":"application/ld+json"}):
         try:
-            data=json.loads(m.group(1))
+            data=json.loads(sc.string)
             if isinstance(data, list):
                 for d in data:
-                    img = d.get("image") if isinstance(d, dict) else None
-                    if img: return img[0] if isinstance(img, list) else img
-            elif isinstance(data, dict):
-                img = data.get("image")
-                if img: return img[0] if isinstance(img, list) else img
+                    if isinstance(d, dict) and d.get("image"):
+                        img=d["image"]; return img[0] if isinstance(img, list) else img
+            elif isinstance(data, dict) and data.get("image"):
+                img=data["image"]; return img[0] if isinstance(img, list) else img
         except: pass
     return None
+
+# ---- テキストからカテゴリ/素材/季節を推定 ----
+CAT_MAP = {
+    "トップス":["tシャツ","tee","シャツ","ブラウス","スウェット","パーカー","ニット","セーター","カーディガン","トップス","pullover","hoodie","sweat","blouse"],
+    "ボトムス":["パンツ","デニム","ジーンズ","スラックス","トラウザー","スカート","ショーツ","ハーフパンツ","shorts","trousers","skirt","jeans"],
+    "アウター":["コート","ジャケット","ブルゾン","ダウン","アウター","マウンテン","ライダース","gジャン","jacket","coat"],
+    "ワンピース":["ワンピース","ドレス","ジャンパースカート","one-piece","dress"],
+    "シューズ":["スニーカー","ブーツ","パンプス","サンダル","shoes","sneaker","boots","heels"],
+    "バッグ":["バッグ","トート","ショルダー","バックパック","リュック","bag","tote","shoulder","backpack"],
+    "アクセ":["帽子","キャップ","ハット","ベルト","マフラー","ストール","アクセ","ネックレス","ピアス","cap","hat","scarf","belt","accessory"]
+}
+MAT_KEYS = ["コットン","綿","ウール","ナイロン","ポリエステル","リネン","麻","デニム","レザー","合皮","カシミヤ","シルク","ダウン","フリース"]
+
+def guess_category_from_text(text:str)->str:
+    t=(text or "").lower()
+    score=[]
+    for cat, kws in CAT_MAP.items():
+        if any(k.lower() in t for k in kws): score.append((cat,1))
+    if score: return score[0][0]
+    return "トップス"
+
+def guess_material_from_text(text:str)->str|None:
+    t=text or ""
+    for k in MAT_KEYS:
+        if k in t: return k
+    return None
+
+def guess_season_from_text(text:str)->str|None:
+    t=(text or "").lower()
+    if any(k in t for k in ["春夏","ss","summer","春/夏"]): return "summer"
+    if any(k in t for k in ["秋冬","fw","winter","秋/冬"]): return "winter"
+    return None
+
 def fetch_from_page(url:str):
+    """商品ページURLから (title, image_bytes, description) を取得（UNIQLO/ZOZO等）"""
     try:
         r=requests.get(url, timeout=10, headers=UA)
-        if r.status_code!=200: return None,None
-        html=r.text
-        title = _meta(html, "og:title") or _meta(html, "twitter:title")
-        img_url = _meta(html, "og:image:secure_url") or _meta(html, "og:image") or _meta(html, "twitter:image")
-        if not img_url: img_url = _jsonld_image(html)
-        if not title:
-            t2=re.search(r'<title[^>]*>(.*?)</title>', html, re.I|re.S)
-            title=t2.group(1).strip() if t2 else None
+        if r.status_code!=200: return None,None,None
+        html=_decode_best(r)
+        soup=BeautifulSoup(html, "html.parser")
+        title = _meta(soup,"og:title") or _meta(soup,"twitter:title") or (soup.title.get_text().strip() if soup.title else None)
+        desc  = _meta(soup,"og:description") or _meta(soup,"description")
+        if title: title = ihtml.unescape(title)
+        img_url = _meta(soup,"og:image:secure_url") or _meta(soup,"og:image") or _meta(soup,"twitter:image")
+        if not img_url: img_url = _jsonld_image(soup)
         if img_url: img_url=urljoin(url, img_url)
-        img_bytes=fetch_image_bytes_from_url(img_url) if img_url else None
-        return title, img_bytes
+        img_bytes=None
+        if img_url:
+            try:
+                r2=requests.get(img_url, timeout=10, headers=UA)
+                if r2.status_code==200: img_bytes=r2.content
+            except: pass
+        return title, img_bytes, desc
     except:
-        return None, None
+        return None, None, None
+
+# ---------- 画像からの簡易推定 ----------
+def pick_top_bottom_from_colors(cols:list[str]):
+    if not cols: return "#2f2f2f","#c9c9c9"
+    bottom = sorted(cols, key=lambda h: hex_luma(h))[0]
+    vivid = [h for h in cols if hex_family(h) not in ("black","white","gray")]
+    top = vivid[0] if vivid else (cols[0] if cols else "#2f2f2f")
+    if top == bottom: bottom = "#c9c9c9"
+    return top, bottom
+
+def guess_season_from_colors(cols:list[str])->str|None:
+    if not cols: return None
+    hsv=[]
+    for h in cols:
+        r,g,b=[v/255 for v in hex_to_rgb(h)]
+        hsv.append(colorsys.rgb_to_hsv(r,g,b))
+    h = sum([x[0] for x in hsv])/len(hsv)
+    s = sum([x[1] for x in hsv])/len(hsv)
+    v = sum([x[2] for x in hsv])/len(hsv)
+    hue=h*360
+    if v>0.75 and s>0.35 and 20<=hue<=70:   return "spring"
+    if v>0.7 and s<0.35:                    return "summer"
+    if v<0.55 and 20<=hue<=80:              return "autumn"
+    if v>0.8 and s>0.6 and (hue<20 or hue>220): return "winter"
+    return None
+
+def guess_category_from_image(img:Image.Image)->str:
+    ar = img.height / max(1,img.width)
+    if ar>=1.4:  # 縦長→ワンピ/ボトム推定
+        return "ボトムス"
+    if ar<=0.9:  # 横長→トップス/アウター
+        return "トップス"
+    return "トップス"
+
+def guess_material_from_colors(cols:list[str])->str:
+    if not cols: return "コットン"
+    v = np.mean([hex_luma(x) for x in cols])
+    if v<90:  return "ウール/ニット"
+    if v>200: return "コットン/リネン"
+    return "コットン"
 
 # ---------- UI ----------
 init_db()
@@ -377,16 +458,6 @@ tab1, tabCal, tabCloset, tabAI, tabProfile = st.tabs(["📒 記録","📅 カレ
 
 SIL_TOP = ["ジャスト/レギュラー","オーバーサイズ","クロップド/短丈","タイト/フィット"]
 SIL_BOTTOM = ["ストレート","ワイド/フレア","スキニー/テーパード","Aライン/スカート","ショーツ"]
-
-def pick_top_bottom_from_colors(cols:list[str]):
-    """暗い/ニュートラル→ボトム、鮮やか→トップに自動割当"""
-    if not cols: return "#2f2f2f","#c9c9c9"
-    # ボトム候補 = 最も暗い色
-    bottom = sorted(cols, key=lambda h: hex_luma(h))[0]
-    # トップ候補 = 一番鮮やかそうな色（明度中間 & グレー以外）
-    vivid = [h for h in cols if hex_family(h) not in ("black","white","gray")]
-    top = vivid[0] if vivid else (cols[0] if cols else "#2f2f2f")
-    return top, bottom if bottom!=top else (top, "#c9c9c9")
 
 # ===== 記録 =====
 with tab1:
@@ -445,8 +516,7 @@ with tabCal:
                         st.session_state["modal_day"] = str(d0)
 
     if st.session_state["modal_day"]:
-        day = st.session_state["modal_day"]
-        lst = fetch_outfits_on(day)
+        day = st.session_state["modal_day"]; lst = fetch_outfits_on(day)
         st.markdown("<div style='position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:10000'>", unsafe_allow_html=True)
         with st.container():
             st.markdown("<div class='card' style='width:92%;max-width:640px'>", unsafe_allow_html=True)
@@ -473,38 +543,62 @@ with tabCloset:
 
     if add_mode=="写真から":
         colC = st.columns(2)
-        name = colC[0].text_input("名前", key="cl_name")
-        category = colC[1].selectbox("カテゴリ", ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"], key="cl_category")
         upi = st.file_uploader("画像", type=["jpg","jpeg","png","webp"], key="cl_img")
-        color_auto="#2f2f2f"
+        # --- 自動推定 ---
+        color_auto="#2f2f2f"; cat_guess="トップス"; season_guess=None; name_suggest="アイテム"; material_guess="コットン"
         if upi:
             img_i = Image.open(upi).convert("RGB")
             st.image(img_i, use_container_width=True)
             cols_auto = extract_dominant_colors(img_i, k=5)
             if cols_auto: color_auto = cols_auto[0]
-            st.caption("自動カラー認識")
+            cat_guess = guess_category_from_image(img_i)
+            season_guess = guess_season_from_colors(cols_auto)
+            cname = JP_COLOR.get(nearest_css_name(color_auto), "カラー")
+            name_suggest = f"{cname} {('Tシャツ' if cat_guess=='トップス' else 'パンツ' if cat_guess=='ボトムス' else cat_guess)}"
+            material_guess = guess_material_from_colors(cols_auto)
+            st.caption("自動カラー/カテゴリ/季節/素材を推定しました（必要に応じて修正）")
             st.markdown(" ".join([f"<span class='swatch' style='background:{h}'></span>" for h in cols_auto]), unsafe_allow_html=True)
+
+        colN = st.columns(2)
+        name = colN[0].text_input("名前", value=name_suggest, key="cl_name")
+        category = colN[1].selectbox("カテゴリ", ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"],
+                                     index=(["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"].index(cat_guess) if cat_guess in ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"] else 0),
+                                     key="cl_category")
         color_hex = st.color_picker("色", color_auto, key="cl_color")
-        season_pref = st.selectbox("得意シーズン", ["指定なし","spring","summer","autumn","winter"], index=0, key="cl_season")
-        material = st.text_input("素材", key="cl_material")
+        colS = st.columns(2)
+        season_pref = colS[0].selectbox("得意シーズン", ["指定なし","spring","summer","autumn","winter"],
+                                        index=(["指定なし","spring","summer","autumn","winter"].index(season_guess) if season_guess in ["spring","summer","autumn","winter"] else 0),
+                                        key="cl_season")
+        material = colS[1].text_input("素材", value=material_guess, key="cl_material")
         notes_i = st.text_area("メモ（用途/特徴）", key="cl_notes")
         if st.button("追加", key="cl_add_btn"):
             img_b = upi.read() if upi else None
-            add_item(name or "Unnamed", category, color_hex, None if season_pref=="指定なし" else season_pref, material, img_b, notes_i)
+            add_item(name or "Unnamed", category, color_hex,
+                     None if season_pref=="指定なし" else season_pref,
+                     material, img_b, notes_i)
             st.success("追加しました")
 
     else:
         url = st.text_input("商品URL", placeholder="https://", key="cl_url")
         if st.button("解析", key="cl_parse"):
-            title, img_bytes = fetch_from_page(url)
+            title, img_bytes, desc = fetch_from_page(url)
             if not title and not img_bytes:
                 st.error("取得できませんでした")
             else:
                 st.session_state["url_title"]=title
                 st.session_state["url_img"]=img_bytes
+                st.session_state["url_desc"]=desc
                 st.success("読み込みました")
+
         title = st.session_state.get("url_title")
         img_bytes = st.session_state.get("url_img")
+        desc = st.session_state.get("url_desc","")
+
+        # --- 推定（文字から） ---
+        cat_from_text = guess_category_from_text((title or "") + " " + (desc or ""))
+        mat_from_text = guess_material_from_text((title or "") + " " + (desc or "")) or ""
+        ssn_from_text = guess_season_from_text((title or "") + " " + (desc or ""))
+
         color_guess="#2f2f2f"
         if img_bytes:
             img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
@@ -512,14 +606,24 @@ with tabCloset:
             cols_auto = extract_dominant_colors(img, k=5)
             if cols_auto: color_guess=cols_auto[0]
             st.markdown(" ".join([f"<span class='swatch' style='background:{h}'></span>" for h in cols_auto]), unsafe_allow_html=True)
+
         colU = st.columns(2)
-        name_url = colU[0].text_input("名前", value=title or "", key="cl_name_url")
-        category_url = colU[1].selectbox("カテゴリ", ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"], key="cl_category_url")
+        name_url = colU[0].text_input("名前", value=(title or ""), key="cl_name_url")  # ← 文字化け対策済タイトル
+        category_url = colU[1].selectbox("カテゴリ", ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"],
+                                         index=(["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"].index(cat_from_text) if cat_from_text in ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"] else 0),
+                                         key="cl_category_url")
         color_url = st.color_picker("色", color_guess, key="cl_color_url")
-        material_url = st.text_input("素材", key="cl_material_url")
-        notes_url = st.text_area("メモ", value=(url or ""), key="cl_notes_url")
+
+        colU2 = st.columns(2)
+        material_url = colU2[0].text_input("素材", value=mat_from_text, key="cl_material_url")
+        season_idx = (["指定なし","spring","summer","autumn","winter"].index(ssn_from_text) if ssn_from_text in ["spring","summer","autumn","winter"] else 0)
+        season_url = colU2[1].selectbox("得意シーズン", ["指定なし","spring","summer","autumn","winter"], index=season_idx, key="cl_season_url")
+
+        notes_url = st.text_area("メモ", value=(url or desc or ""), key="cl_notes_url")
         if st.button("追加", key="cl_add_btn_url", disabled=(not name_url and img_bytes is None)):
-            add_item(name_url or "Unnamed", category_url, color_url, None, material_url, img_bytes, notes_url)
+            add_item(name_url or "Unnamed", category_url, color_url,
+                     None if season_url=="指定なし" else season_url,
+                     material_url, img_bytes, notes_url)
             st.success("追加しました")
 
     st.markdown("---")
