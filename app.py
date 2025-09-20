@@ -1,9 +1,9 @@
-# app.py — Outfit Log (Mobile+)
-# - use_container_width で警告解消 / 全ウィジェットに unique key 付与（DuplicateElementId対策）
-# - 商品URL取込：UNIQLO/ZOZOTOWN 他（og:image / twitter:image / JSON-LD の image を解析）
-# - クローゼットからのAIコーデ自動生成（天候・PCシーズン・体格を考慮）
-# - 生成コーデの保存＆⭐️評価（5段階）
-# - 体格/パーソナルカラーをプロフィールに保存 → 推薦に反映
+# app.py — Outf!ts
+# 変更点:
+# - 写真アップ時に自動カラー認識→トップ/ボトム色へ自動反映（手動へ切替も可）
+# - アプリ名を "Outf!ts" に統一（余計な文言は省略）
+# - 背景をアパレル系カラー（ベージュ×チャコールの柔らかいグラデ）
+# - AIコーデの環境入力を「体感/空気/雨」に変更（湿度考慮の素材優先）
 
 import streamlit as st
 import pandas as pd, numpy as np
@@ -12,7 +12,41 @@ import sqlite3, os, io, requests, colorsys, calendar, json, re
 from urllib.parse import urljoin
 from datetime import datetime
 
-st.set_page_config(page_title="Outfit Log — Mobile", layout="centered")
+st.set_page_config(page_title="Outf!ts", layout="centered")
+
+# ---------- Apparel-like Theme ----------
+st.markdown("""
+<style>
+:root{
+  --bg-a:#f6f1e7;   /* warm beige */
+  --bg-b:#ece7df;
+  --ink:#222;
+  --accent:#1f7a7a; /* muted teal */
+}
+html, body {
+  background: linear-gradient(135deg, var(--bg-a), var(--bg-b));
+}
+.block-container{
+  background: #ffffffcc;
+  backdrop-filter: blur(4px);
+  border: 1px solid #eee;
+  border-radius: 16px;
+  padding: 18px 16px 30px;
+}
+.stTabs [role="tab"]{
+  padding:12px 10px; border-radius:10px; font-weight:600;
+}
+.stTabs [role="tab"][aria-selected="true"]{
+  background:#fff; border:1px solid #ddd;
+}
+button[kind="primary"]{
+  background: var(--accent) !important; border:0 !important;
+}
+.card {border:1px solid #eee; border-radius:12px; padding:10px; margin:8px 0; background:#fff;}
+.badge{display:inline-block;padding:6px 10px;border-radius:999px;border:1px solid #ddd;margin-right:6px;}
+.swatch{width:24px;height:24px;border:1px solid #aaa;border-radius:6px;display:inline-block;margin-right:6px;}
+</style>
+""", unsafe_allow_html=True)
 
 # ---------- PWA-ish（任意） ----------
 st.markdown("""
@@ -50,7 +84,6 @@ def init_db():
           name TEXT, category TEXT, color_hex TEXT, season_pref TEXT,
           material TEXT, img BLOB, notes TEXT
         )""")
-        # 生成コーデ履歴＋評価
         c.execute("""
         CREATE TABLE IF NOT EXISTS coords(
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,10 +91,10 @@ def init_db():
           top_id INTEGER, bottom_id INTEGER, shoes_id INTEGER, bag_id INTEGER,
           ctx TEXT, score REAL, rating INTEGER
         )""")
-        # 既存DBに後から追加された列は ALTER で安全に拡張
-        try: c.execute("ALTER TABLE profile ADD COLUMN body_shape TEXT");   # 1回目のみ
+        # 後方互換 ALTER
+        try: c.execute("ALTER TABLE profile ADD COLUMN body_shape TEXT")
         except: pass
-        try: c.execute("ALTER TABLE profile ADD COLUMN height_cm REAL");
+        try: c.execute("ALTER TABLE profile ADD COLUMN height_cm REAL")
         except: pass
         conn.commit()
 
@@ -156,6 +189,8 @@ CSS_COLORS = {
 }
 def hex_to_rgb(h): h=h.lstrip("#"); return tuple(int(h[i:i+2],16) for i in (0,2,4))
 def rgb_to_hex(rgb): return "#{:02x}{:02x}{:02x}".format(*rgb)
+def hex_luma(h):
+    r,g,b=hex_to_rgb(h); return 0.2126*r+0.7152*g+0.0722*b  # 明度推定
 def nearest_css_name(hexstr):
     r,g,b = hex_to_rgb(hexstr); best,bd=None,10**9
     for name,hx in CSS_COLORS.items():
@@ -215,121 +250,7 @@ def palette_distance(hexstr, user_season):
         if d<best: best=d
     return best
 
-# ---------- Weather ----------
-def fetch_open_meteo(lat, lon):
-    try:
-        url=(f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
-             "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto")
-        r=requests.get(url, timeout=6)
-        if r.status_code==200: return r.json()
-    except: return None
-    return None
-def weather_tip(daily):
-    try:
-        tmax=daily["temperature_2m_max"][0]; tmin=daily["temperature_2m_min"][0]; p=daily["precipitation_probability_max"][0]
-    except: return "天気情報を取得できませんでした。"
-    msg=[]
-    if tmax>=27: msg.append("暑い：半袖/軽素材/通気◎")
-    elif tmax>=20: msg.append("穏やか：長袖1枚 or 薄羽織")
-    elif tmax>=12: msg.append("肌寒い：薄手ニット/ライトアウター")
-    else: msg.append("寒い：コート/中綿/マフラー")
-    if p>=50: msg.append("降水高め：撥水アウター/防水シューズ/傘を")
-    return f"{' / '.join(msg)}（最高{tmax:.0f}℃・最低{tmin:.0f}℃・降水{p}%）"
-
-# ---------- Helpers ----------
-def img_from_bytes(b): return Image.open(io.BytesIO(b)).convert("RGB")
-
-def make_share_card(row, out_path="data/exports/share.png", weather=None):
-    os.makedirs("data/exports", exist_ok=True)
-    (oid,dd,seas,ts,bs,tc,bc,cols_js,img_b,nt)=row
-    W,H=1080,1350
-    base=Image.new("RGB",(W,H),(250,250,250)); draw=ImageDraw.Draw(base)
-    draw.rectangle((0,0,W,110), fill=(17,17,17)); draw.text((36,34),"Outfit Log", fill=(255,255,255))
-    y=130
-    try:
-        img=img_from_bytes(img_b)
-        r=4/5; iw,ih=img.width,img.height
-        if iw/ih>r:
-            nw=int(ih*r); x0=(iw-nw)//2; box=(x0,0,x0+nw,ih)
-        else:
-            nh=int(iw/r); y0=(ih-nh)//2; box=(0,y0,iw,y0+nh)
-        img=img.crop(box).resize((W-160,720), Image.LANCZOS)
-        base.paste(img,((W-img.width)//2, y)); y+=img.height+14
-    except: y+=14
-    try: colors=json_loads(cols_js)[:5]
-    except: colors=[]
-    sw=80; gap=16
-    for i,hx in enumerate(colors):
-        x=100+i*(sw+gap); draw.rectangle((x,y,x+sw,y+sw), fill=hex_to_rgb(hx), outline=(30,30,30))
-    y+=sw+14
-    draw.text((100,y), f"Top: {tc}", fill=(0,0,0)); y+=30
-    draw.text((100,y), f"Bottom: {bc}", fill=(0,0,0)); y+=30
-    if weather:
-        draw.text((100,y), f"Weather: {weather}", fill=(50,50,50)); y+=28
-    draw.text((100,H-70), f"{dd} / {seas or '-'}", fill=(80,80,80))
-    base.save(out_path,"PNG")
-    with open(out_path,"rb") as f: return f.read()
-
-# ---------- URL 取り込み（ZOZO強化） ----------
-UA = {"User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-      "Accept-Language":"ja,en;q=0.8"}
-
-def fetch_image_bytes_from_url(url:str):
-    try:
-        r=requests.get(url, timeout=10, headers=UA)
-        if r.status_code==200: return r.content
-    except: return None
-    return None
-
-def _meta(content, name):
-    m=re.search(rf'<meta[^>]+(?:property|name)=["\']{re.escape(name)}["\'][^>]+content=["\']([^"\']+)["\']', content, re.I)
-    return m.group(1) if m else None
-
-def _jsonld_image(content):
-    # JSON-LDの"image"（配列 or 文字列）
-    for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', content, re.I|re.S):
-        try:
-            data=json.loads(m.group(1))
-            if isinstance(data, list):
-                for d in data:
-                    img = d.get("image") if isinstance(d, dict) else None
-                    if img: return img[0] if isinstance(img, list) else img
-            elif isinstance(data, dict):
-                img = data.get("image")
-                if img: return img[0] if isinstance(img, list) else img
-        except: pass
-    return None
-
-def fetch_from_page(url:str):
-    """商品ページURLから title と image を推定（UNIQLO/ZOZO/他）"""
-    try:
-        r=requests.get(url, timeout=10, headers=UA)
-        if r.status_code!=200: return None,None
-        html=r.text
-
-        # 1) og:title / og:image / twitter:image
-        title = _meta(html, "og:title") or _meta(html, "twitter:title")
-        img_url = _meta(html, "og:image:secure_url") or _meta(html, "og:image") or _meta(html, "twitter:image")
-
-        # 2) JSON-LD の image
-        if not img_url:
-            img_url = _jsonld_image(html)
-
-        # 3) Fallback: <title>
-        if not title:
-            t2=re.search(r'<title[^>]*>(.*?)</title>', html, re.I|re.S)
-            title=t2.group(1).strip() if t2 else None
-
-        if img_url:
-            img_url=urljoin(url, img_url)
-        img_bytes=fetch_image_bytes_from_url(img_url) if img_url else None
-        return title, img_bytes
-    except:
-        return None, None
-
-# ---------- 推薦/スコアリング ----------
-PURPOSES = ["指定なし","通勤","デート","カジュアル","スポーツ","フォーマル","雨の日"]
-
+# ---------- Weather-like scoring helpers ----------
 def purpose_match(notes:str, want:str)->int:
     if not want or want=="指定なし": return 0
     n=notes or ""
@@ -345,36 +266,36 @@ def body_shape_bonus(notes:str, body:str|None, category:str)->int:
     if not body: return 0
     n=(notes or "").lower()
     b=body
-    # ゆるいヒューリスティック
-    if b=="straight":   # 骨格ストレート
-        if category in ["ボトムス"] and any(k in n for k in ["テーパード","センタープレス","ストレート"]): return 1
-        if category in ["トップス","アウター"] and any(k in n for k in ["vネック","襟付き","構築的","ジャケット"]): return 1
-    if b=="wave":       # 骨格ウェーブ
-        if category in ["ボトムス"] and any(k in n for k in ["ハイウエスト","aライン","フレア"]): return 1
-        if category in ["トップス"] and any(k in n for k in ["短丈","クロップド","柔らかい","リブ"]): return 1
-    if b=="natural":    # 骨格ナチュラル
+    if b=="straight":
+        if category=="ボトムス" and any(k in n for k in ["テーパード","センタープレス","ストレート"]): return 1
+        if category in ["トップス","アウター"] and any(k in n for k in ["vネック","襟","ジャケット","構築的"]): return 1
+    if b=="wave":
+        if category=="ボトムス" and any(k in n for k in ["ハイウエスト","aライン","フレア"]): return 1
+        if category=="トップス" and any(k in n for k in ["短丈","クロップド","柔らか","リブ"]): return 1
+    if b=="natural":
         if any(k in n for k in ["ワイド","オーバーサイズ","ドロップショルダー","リネン","ツイード"]): return 1
     return 0
 
-def weather_bonus(material:str|None, felt:int, rainy:bool)->int:
+def climate_bonus(material:str|None, heat:str, humidity:str, rainy:bool)->int:
+    """heat: 寒い/涼しい/ちょうど/暑い/猛暑, humidity: 乾燥/普通/湿度高い"""
     m=(material or "").lower()
     s=0
-    if felt>=27 and any(k in m for k in ["linen","リネン","cotton","コットン","メッシュ","ドライ"]): s+=1
-    if felt<=12 and any(k in m for k in ["wool","ウール","ダウン","中綿","フリース"]): s+=1
+    if heat in ["暑い","猛暑"] and any(k in m for k in ["linen","リネン","cotton","コットン","メッシュ","ドライ"]): s+=1
+    if heat in ["寒い"] and any(k in m for k in ["wool","ウール","ダウン","中綿","フリース","キルト"]): s+=1
+    if humidity=="湿度高い" and any(k in m for k in ["ドライ","吸汗","速乾","メッシュ","ナイロン","nylon"]): s+=1
+    if humidity=="乾燥" and any(k in m for k in ["ウール","ニット","フリース"]): s+=1
     if rainy and any(k in m for k in ["ナイロン","nylon","ゴア","gore","防水","撥水"]): s+=1
     return s
 
 def color_pair_score(top_hex:str, item_hex:str, season:str|None)->float:
-    # 補色/類似/トライアド候補への距離 + シーズンパレット近さ
     r = adjust_harmony(top_hex,"complement")+adjust_harmony(top_hex,"analogous")+adjust_harmony(top_hex,"triadic")
-    # 最小距離
     def dist(h1,h2):
         r1,g1,b1=hex_to_rgb(h1); r2,g2,b2=hex_to_rgb(h2); return (r1-r2)**2+(g1-g2)**2+(b1-b2)**2
     d = min([dist(item_hex, h) for h in r] + [dist(item_hex, top_hex)])
     return d + 0.1*palette_distance(item_hex, season)
 
-def pick_best(items, top_hex, season, body_shape, want, felt, rainy, category):
-    cand=[it for it in items if it[2]==category]  # (id,name,cat,color_hex,season_pref,material,img,notes)
+def pick_best(items, top_hex, season, body_shape, want, heat, humidity, rainy, category):
+    cand=[it for it in items if it[2]==category]
     if not cand: return None, 1e9
     scored=[]
     for row in cand:
@@ -383,13 +304,12 @@ def pick_best(items, top_hex, season, body_shape, want, felt, rainy, category):
         s -= 200 if sp and season and sp==season else 0
         s -= 120*purpose_match(nts or "", want)
         s -= 80*body_shape_bonus(nts or "", body_shape, cat)
-        s -= 60*weather_bonus(mat, felt, rainy)
+        s -= 60*climate_bonus(mat, heat, humidity, rainy)
         scored.append((s,row))
     scored.sort(key=lambda x:x[0])
     return scored[0][1], scored[0][0]
 
-def generate_outfit_from_closet(all_items, season, body_shape, want, felt, rainy):
-    # 1) 主役トップを自動選択（季節×体格×目的で最良）
+def generate_outfit_from_closet(all_items, season, body_shape, want, heat, humidity, rainy):
     tops=[it for it in all_items if it[2]=="トップス"]
     if not tops: return None, None
     t_best=None; t_score=1e9
@@ -398,62 +318,110 @@ def generate_outfit_from_closet(all_items, season, body_shape, want, felt, rainy
         s  = 0.2*palette_distance(hx, season)
         s -= 100*(sp==season) if sp and season else 0
         s -= 80*body_shape_bonus(nts or "", body_shape, cat)
-        s -= 40*weather_bonus(mat, felt, rainy)
+        s -= 40*climate_bonus(mat, heat, humidity, rainy)
         if s<t_score: t_score=s; t_best=row
     top=t_best
-    # 2) 他アイテム
-    bottom,b_sc = pick_best(all_items, top[3], season, body_shape, want, felt, rainy, "ボトムス")
-    shoes ,s_sc = pick_best(all_items, top[3], season, body_shape, want, felt, rainy, "シューズ")
-    bag   ,g_sc = pick_best(all_items, top[3], season, body_shape, want, felt, rainy, "バッグ")
+    bottom,b_sc = pick_best(all_items, top[3], season, body_shape, want, heat, humidity, rainy, "ボトムス")
+    shoes ,s_sc = pick_best(all_items, top[3], season, body_shape, want, heat, humidity, rainy, "シューズ")
+    bag   ,g_sc = pick_best(all_items, top[3], season, body_shape, want, heat, humidity, rainy, "バッグ")
     total_score = t_score + b_sc + s_sc + g_sc
     return {"top":top,"bottom":bottom,"shoes":shoes,"bag":bag}, total_score
+
+# ---------- URL 取り込み（UNIQLO/ZOZOなど） ----------
+UA = {"User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1","Accept-Language":"ja,en;q=0.8"}
+def fetch_image_bytes_from_url(url:str):
+    try:
+        r=requests.get(url, timeout=10, headers=UA)
+        if r.status_code==200: return r.content
+    except: return None
+    return None
+def _meta(content, name):
+    m=re.search(rf'<meta[^>]+(?:property|name)=["\']{re.escape(name)}["\'][^>]+content=["\']([^"\']+)["\']', content, re.I)
+    return m.group(1) if m else None
+def _jsonld_image(content):
+    for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', content, re.I|re.S):
+        try:
+            data=json.loads(m.group(1))
+            if isinstance(data, list):
+                for d in data:
+                    img = d.get("image") if isinstance(d, dict) else None
+                    if img: return img[0] if isinstance(img, list) else img
+            elif isinstance(data, dict):
+                img = data.get("image")
+                if img: return img[0] if isinstance(img, list) else img
+        except: pass
+    return None
+def fetch_from_page(url:str):
+    try:
+        r=requests.get(url, timeout=10, headers=UA)
+        if r.status_code!=200: return None,None
+        html=r.text
+        title = _meta(html, "og:title") or _meta(html, "twitter:title")
+        img_url = _meta(html, "og:image:secure_url") or _meta(html, "og:image") or _meta(html, "twitter:image")
+        if not img_url: img_url = _jsonld_image(html)
+        if not title:
+            t2=re.search(r'<title[^>]*>(.*?)</title>', html, re.I|re.S)
+            title=t2.group(1).strip() if t2 else None
+        if img_url: img_url=urljoin(url, img_url)
+        img_bytes=fetch_image_bytes_from_url(img_url) if img_url else None
+        return title, img_bytes
+    except:
+        return None, None
 
 # ---------- UI ----------
 init_db()
 profile = load_profile()
 
-st.title("📱 Outfit Log — モバイル（URL取込・AIコーデ・評価対応）")
-tab1, tabCal, tabCloset, tabAI, tabWx, tabProfile = st.tabs(
-    ["📒 記録","📅 カレンダー","🧳 クローゼット","🤖 AIコーデ","☀ 天気","👤 プロフィール"]
-)
+st.title("Outf!ts")
+tab1, tabCal, tabCloset, tabAI, tabProfile = st.tabs(["📒 記録","📅 カレンダー","🧳 クローゼット","🤖 AIコーデ","👤 プロフィール"])
 
 SIL_TOP = ["ジャスト/レギュラー","オーバーサイズ","クロップド/短丈","タイト/フィット"]
 SIL_BOTTOM = ["ストレート","ワイド/フレア","スキニー/テーパード","Aライン/スカート","ショーツ"]
 
+def pick_top_bottom_from_colors(cols:list[str]):
+    """暗い/ニュートラル→ボトム、鮮やか→トップに自動割当"""
+    if not cols: return "#2f2f2f","#c9c9c9"
+    # ボトム候補 = 最も暗い色
+    bottom = sorted(cols, key=lambda h: hex_luma(h))[0]
+    # トップ候補 = 一番鮮やかそうな色（明度中間 & グレー以外）
+    vivid = [h for h in cols if hex_family(h) not in ("black","white","gray")]
+    top = vivid[0] if vivid else (cols[0] if cols else "#2f2f2f")
+    return top, bottom if bottom!=top else (top, "#c9c9c9")
+
 # ===== 記録 =====
 with tab1:
-    st.subheader("今日のコーデを記録")
     d = st.date_input("日付", value=pd.Timestamp.today(), key="rec_date")
-    up = st.file_uploader("写真をアップ（カメラ可）", type=["jpg","jpeg","png","webp"], key="rec_photo")
+    up = st.file_uploader("写真（カメラ可）", type=["jpg","jpeg","png","webp"], key="rec_photo")
     colA, colB = st.columns(2)
-    top_sil = colA.selectbox("トップのシルエット", SIL_TOP, index=0, key="rec_top_sil")
-    bottom_sil = colB.selectbox("ボトムのシルエット", SIL_BOTTOM, index=0, key="rec_bottom_sil")
-    notes = st.text_area("メモ", placeholder="例：20℃/カフェ/よく歩く", key="rec_notes")
+    top_sil = colA.selectbox("トップ", SIL_TOP, index=0, key="rec_top_sil")
+    bottom_sil = colB.selectbox("ボトム", SIL_BOTTOM, index=0, key="rec_bottom_sil")
+    notes = st.text_area("メモ", placeholder="", key="rec_notes")
 
-    auto_colors=[]
+    auto_colors=[]; auto_top="#2f2f2f"; auto_bottom="#c9c9c9"
     if up is not None:
         img = Image.open(up).convert("RGB")
-        st.image(img, caption="プレビュー", use_container_width=True)
+        st.image(img, use_container_width=True)
         auto_colors = extract_dominant_colors(img, k=5)
-        st.caption("写真から主要色")
-        cols = st.columns(len(auto_colors) or 1)
-        for i,cx in enumerate(auto_colors or ["#888888"]):
-            cols[i].markdown(f"<div style='width:24px;height:24px;background:{cx};border:1px solid #aaa;border-radius:6px'></div>", unsafe_allow_html=True)
+        auto_top, auto_bottom = pick_top_bottom_from_colors(auto_colors)
+        st.caption("自動カラー認識")
+        st.markdown(" ".join([f"<span class='swatch' style='background:{h}'></span>" for h in auto_colors]), unsafe_allow_html=True)
 
-    default_top = auto_colors[0] if auto_colors else "#2f2f2f"
-    default_bottom = (auto_colors[1] if len(auto_colors)>1 else "#c9c9c9") if auto_colors else "#c9c9c9"
-    col1, col2 = st.columns(2)
-    top_color = col1.color_picker("トップ色", default_top, key="rec_top_color")
-    bottom_color = col2.color_picker("ボトム色", default_bottom, key="rec_bottom_color")
+    use_auto = st.toggle("自動色認識を使う", value=True, key="use_auto_colors")
+    if use_auto:
+        top_color, bottom_color = auto_top, auto_bottom
+        st.markdown(f"<div class='badge'>Top: {top_color}</div><div class='badge'>Bottom: {bottom_color}</div>", unsafe_allow_html=True)
+    else:
+        col1, col2 = st.columns(2)
+        top_color = col1.color_picker("トップ色", auto_top, key="rec_top_color")
+        bottom_color = col2.color_picker("ボトム色", auto_bottom, key="rec_bottom_color")
 
-    if st.button("保存する", type="primary", key="rec_save", disabled=(up is None)):
+    if st.button("保存", type="primary", key="rec_save", disabled=(up is None)):
         img_bytes = up.read()
         insert_outfit(str(pd.to_datetime(d).date()), profile.get("season"), top_sil, bottom_sil, top_color, bottom_color, auto_colors, img_bytes, notes)
-        st.success("保存しました！")
+        st.success("保存しました")
 
 # ===== カレンダー =====
 with tabCal:
-    st.subheader("月間カレンダー（タップで詳細）")
     today = pd.Timestamp.today()
     colM = st.columns(2)
     year = colM[0].number_input("年", value=int(today.year), step=1, min_value=2000, max_value=2100, key="cal_year")
@@ -471,7 +439,7 @@ with tabCal:
                 if d0.month != int(month): style += "; opacity:0.5"
                 st.markdown(f"<div style='{style}'><b>{d0.day}</b></div>", unsafe_allow_html=True)
                 if slots:
-                    try: st.image(img_from_bytes(slots[0][8]), use_container_width=True)
+                    try: st.image(Image.open(io.BytesIO(slots[0][8])), use_container_width=True)
                     except: pass
                     if st.button("詳細", key=f"detail_{d0.isoformat()}"):
                         st.session_state["modal_day"] = str(d0)
@@ -482,95 +450,91 @@ with tabCal:
         st.markdown("<div style='position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:10000'>", unsafe_allow_html=True)
         with st.container():
             st.markdown("<div class='card' style='width:92%;max-width:640px'>", unsafe_allow_html=True)
-            st.markdown(f"### {day} の記録")
-            if st.button("× 閉じる", key="cal_close"):
+            st.markdown(f"### {day}")
+            if st.button("閉じる", key="cal_close"):
                 st.session_state["modal_day"] = None
                 st.experimental_rerun()
             for row in lst:
                 oid, dd, seas, ts, bs, tc, bc, cols_js, img_b, nt = row
                 colm = st.columns([1,2])
                 with colm[0]:
-                    try: st.image(img_from_bytes(img_b), use_container_width=True)
+                    try: st.image(Image.open(io.BytesIO(img_b)), use_container_width=True)
                     except: st.write("画像なし")
                 with colm[1]:
-                    st.write(f"Season: {seas or '-'} / Top:{ts}({tc}) / Bottom:{bs}({bc})")
+                    st.write(f"Top:{ts}({tc}) / Bottom:{bs}({bc})")
                     st.caption(nt or "")
-                    if st.button("🖼 共有画像を作る", key=f"export_{oid}"):
-                        prof = load_profile()
-                        wx = None
-                        if prof.get("home_lat") and prof.get("home_lon"):
-                            data = fetch_open_meteo(prof["home_lat"], prof["home_lon"])
-                            if data and "daily" in data: wx = weather_tip(data["daily"])
-                        imgbytes = make_share_card(row, out_path=f"data/exports/share_{oid}.png", weather=wx)
-                        st.download_button("画像をDL", data=imgbytes, file_name=f"outfit_{dd}_{oid}.png", mime="image/png", key=f"dl_{oid}")
             st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
 # ===== クローゼット =====
 with tabCloset:
-    st.subheader("アイテム追加")
-    add_mode = st.radio("追加方法", ["写真から追加","URLから追加"], horizontal=True, key="cl_add_mode")
+    st.subheader("追加")
+    add_mode = st.radio("", ["写真から","URLから"], horizontal=True, key="cl_add_mode")
 
-    if add_mode=="写真から追加":
+    if add_mode=="写真から":
         colC = st.columns(2)
-        name = colC[0].text_input("名前/アイテム名", placeholder="例：オーバーシャツ", key="cl_name")
+        name = colC[0].text_input("名前", key="cl_name")
         category = colC[1].selectbox("カテゴリ", ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"], key="cl_category")
-        color_hex = st.color_picker("色", "#2f2f2f", key="cl_color")
-        colC2 = st.columns(2)
-        season_pref = colC2[0].selectbox("得意シーズン", ["指定なし","spring","summer","autumn","winter"], index=0, key="cl_season")
-        material = colC2[1].text_input("素材", placeholder="例：コットン/ウール/リネン/ナイロン", key="cl_material")
-        upi = st.file_uploader("アイテム画像", type=["jpg","jpeg","png","webp"], key="cl_img")
-        notes_i = st.text_area("メモ（用途/特徴）", placeholder="例：撥水 スニーカー / センタープレス / Vネック", key="cl_notes")
-
-        if st.button("追加する", key="cl_add_btn"):
+        upi = st.file_uploader("画像", type=["jpg","jpeg","png","webp"], key="cl_img")
+        color_auto="#2f2f2f"
+        if upi:
+            img_i = Image.open(upi).convert("RGB")
+            st.image(img_i, use_container_width=True)
+            cols_auto = extract_dominant_colors(img_i, k=5)
+            if cols_auto: color_auto = cols_auto[0]
+            st.caption("自動カラー認識")
+            st.markdown(" ".join([f"<span class='swatch' style='background:{h}'></span>" for h in cols_auto]), unsafe_allow_html=True)
+        color_hex = st.color_picker("色", color_auto, key="cl_color")
+        season_pref = st.selectbox("得意シーズン", ["指定なし","spring","summer","autumn","winter"], index=0, key="cl_season")
+        material = st.text_input("素材", key="cl_material")
+        notes_i = st.text_area("メモ（用途/特徴）", key="cl_notes")
+        if st.button("追加", key="cl_add_btn"):
             img_b = upi.read() if upi else None
             add_item(name or "Unnamed", category, color_hex, None if season_pref=="指定なし" else season_pref, material, img_b, notes_i)
             st.success("追加しました")
 
-    else:  # URLから追加（UNIQLO/ZOZOTOWN等）
-        url = st.text_input("商品ページのURL", placeholder="https://...", key="cl_url")
-        if st.button("ページを解析", key="cl_parse"):
+    else:
+        url = st.text_input("商品URL", placeholder="https://", key="cl_url")
+        if st.button("解析", key="cl_parse"):
             title, img_bytes = fetch_from_page(url)
             if not title and not img_bytes:
-                st.error("取得できませんでした。URLをご確認ください。")
+                st.error("取得できませんでした")
             else:
-                colors = []
-                if img_bytes:
-                    img = img_from_bytes(img_bytes)
-                    st.image(img, caption=title or "画像", use_container_width=True)
-                    colors = extract_dominant_colors(img, k=5)
                 st.session_state["url_title"]=title
                 st.session_state["url_img"]=img_bytes
-                st.session_state["url_colors"]=colors
-                st.success("候補を読み込みました")
-
+                st.success("読み込みました")
         title = st.session_state.get("url_title")
         img_bytes = st.session_state.get("url_img")
-        colors = st.session_state.get("url_colors", [])
+        color_guess="#2f2f2f"
+        if img_bytes:
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            st.image(img, use_container_width=True)
+            cols_auto = extract_dominant_colors(img, k=5)
+            if cols_auto: color_guess=cols_auto[0]
+            st.markdown(" ".join([f"<span class='swatch' style='background:{h}'></span>" for h in cols_auto]), unsafe_allow_html=True)
         colU = st.columns(2)
-        name_url = colU[0].text_input("名前/アイテム名", value=title or "", key="cl_name_url")
+        name_url = colU[0].text_input("名前", value=title or "", key="cl_name_url")
         category_url = colU[1].selectbox("カテゴリ", ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"], key="cl_category_url")
-        color_url = st.color_picker("色（推定を調整可）", colors[0] if colors else "#2f2f2f", key="cl_color_url")
-        material_url = st.text_input("素材", placeholder="例：コットン/ナイロン", key="cl_material_url")
+        color_url = st.color_picker("色", color_guess, key="cl_color_url")
+        material_url = st.text_input("素材", key="cl_material_url")
         notes_url = st.text_area("メモ", value=(url or ""), key="cl_notes_url")
-        if st.button("この内容で追加", key="cl_add_btn_url", disabled=(not name_url and img_bytes is None)):
+        if st.button("追加", key="cl_add_btn_url", disabled=(not name_url and img_bytes is None)):
             add_item(name_url or "Unnamed", category_url, color_url, None, material_url, img_bytes, notes_url)
-            st.success("追加しました（URLから）")
+            st.success("追加しました")
 
     st.markdown("---")
-    st.subheader("クローゼット一覧 / 編集")
-    filt = st.selectbox("カテゴリで絞り込み", ["すべて","トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"], index=0, key="cl_filter")
+    st.subheader("一覧 / 編集")
+    filt = st.selectbox("絞り込み", ["すべて","トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"], index=0, key="cl_filter")
     items = list_items(filt)
-    st.caption(f"{len(items)}件")
     for iid, nm, cat, hx, sp, mat, imgb, nts in items:
         with st.expander(f"{nm}（{cat}）", expanded=False):
-            colv = st.columns([1,2])
-            with colv[0]:
+            cols = st.columns([1,2])
+            with cols[0]:
                 if imgb: 
-                    try: st.image(img_from_bytes(imgb), use_container_width=True)
+                    try: st.image(Image.open(io.BytesIO(imgb)), use_container_width=True)
                     except: st.write("画像なし")
                 else: st.write("画像なし")
-            with colv[1]:
+            with cols[1]:
                 ename = st.text_input("名前", value=nm, key=f"edit_name_{iid}")
                 ecat = st.selectbox("カテゴリ", ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"],
                                     index=(["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"].index(cat) if cat in ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"] else 0),
@@ -581,114 +545,64 @@ with tabCloset:
                                    key=f"edit_season_{iid}")
                 emat = st.text_input("素材", value=mat or "", key=f"edit_mat_{iid}")
                 enotes = st.text_area("メモ", value=nts or "", key=f"edit_notes_{iid}")
-                eup = st.file_uploader("画像を差し替え（任意）", type=["jpg","jpeg","png","webp"], key=f"edit_img_{iid}")
+                eup = st.file_uploader("画像差し替え（任意）", type=["jpg","jpeg","png","webp"], key=f"edit_img_{iid}")
                 if st.button("保存", key=f"edit_save_{iid}"):
                     new_img_bytes = eup.read() if eup else None
                     update_item(iid, ename, ecat, ehx, None if esp=="指定なし" else esp, emat, new_img_bytes, enotes)
-                    st.success("保存しました（再読込で反映）")
+                    st.success("保存しました")
 
 # ===== AIコーデ =====
 with tabAI:
-    st.subheader("🤖 登録アイテムからAIコーデを提案（評価つき）")
     all_items = list_items("すべて")
     if not all_items:
-        st.info("まずはクローゼットにアイテムを登録してください。")
+        st.info("まずアイテムを登録してください")
     else:
-        colctx = st.columns(3)
-        want = colctx[0].selectbox("用途", PURPOSES, index=0, key="ai_want")
-        felt = colctx[1].slider("体感温度（℃）", 0, 40, 22, key="ai_felt")
-        rainy= colctx[2].toggle("今日は雨", value=False, key="ai_rain")
-        season = profile.get("season")
-        body_shape = profile.get("body_shape")
+        colctx = st.columns(4)
+        want = colctx[0].selectbox("用途", ["指定なし","通勤","デート","カジュアル","スポーツ","フォーマル","雨の日"], index=0, key="ai_want")
+        heat = colctx[1].selectbox("体感", ["寒い","涼しい","ちょうど","暑い","猛暑"], index=2, key="ai_heat")
+        humidity = colctx[2].selectbox("空気", ["乾燥","普通","湿度高い"], index=1, key="ai_humid")
+        rainy= colctx[3].toggle("雨", value=False, key="ai_rain")
+        season = profile.get("season"); body_shape = profile.get("body_shape")
 
-        if st.button("コーデを生成", key="ai_gen"):
-            outfit, score = generate_outfit_from_closet(all_items, season, body_shape, want, int(felt), bool(rainy))
+        if st.button("生成", key="ai_gen"):
+            outfit, score = generate_outfit_from_closet(all_items, season, body_shape, want, heat, humidity, rainy)
             if not outfit:
-                st.warning("候補が見つかりませんでした（トップス/ボトムス/靴/バッグを登録してください）。")
+                st.warning("候補が見つかりませんでした")
             else:
-                st.markdown("### 提案セット")
+                st.markdown("### 提案")
                 cols = st.columns(4)
                 labels=[("トップ","top"),("ボトム","bottom"),("靴","shoes"),("バッグ","bag")]
                 for j,(label,key) in enumerate(labels):
                     with cols[j]:
                         row = outfit[key]
                         if row:
-                            if row[6]: st.image(img_from_bytes(row[6]), use_container_width=True)
+                            if row[6]: st.image(Image.open(io.BytesIO(row[6])), use_container_width=True)
                             st.caption(f"{label}：{row[1]} / {row[3]}")
                         else:
-                            st.caption(f"{label}：候補なし")
-
-                st.caption(f"内部スコア（小さいほど適合）：{score:.1f}")
-                rating = st.select_slider("このコーデの評価", options=[1,2,3,4,5], value=4, key="ai_rating")
-                if st.button("保存（履歴に残す）", key="ai_save"):
+                            st.caption(f"{label}：なし")
+                st.caption(f"score {score:.1f}")
+                rating = st.select_slider("評価", options=[1,2,3,4,5], value=4, key="ai_rating")
+                if st.button("保存", key="ai_save"):
                     save_coord(outfit["top"][0], outfit["bottom"][0] if outfit["bottom"] else None,
                                outfit["shoes"][0] if outfit["shoes"] else None,
                                outfit["bag"][0] if outfit["bag"] else None,
-                               {"want":want,"felt":felt,"rainy":rainy,"season":season,"body_shape":body_shape},
+                               {"want":want,"heat":heat,"humidity":humidity,"rainy":rainy,"season":season,"body_shape":body_shape},
                                float(score), int(rating))
-                    st.success("保存しました！✨ ありがとう、評価は次回の学習に使われます。")
-
-# ===== 天気 =====
-with tabWx:
-    st.subheader("☀ 天気 × コーデメモ")
-    try:
-        q = st.query_params
-        lat_q = q.get("lat", None); lon_q = q.get("lon", None)
-    except Exception:
-        q = st.experimental_get_query_params()
-        lat_q = q.get("lat", [None])[0]; lon_q = q.get("lon", [None])[0]
-
-    city = st.text_input("都市名（メモ用）", value=profile.get("city") or "Tokyo", key="wx_city")
-    colLL = st.columns(2)
-    lat = colLL[0].number_input("緯度", value=float(lat_q) if lat_q else float(profile.get("home_lat") or 35.68), step=0.01, format="%.5f", key="wx_lat")
-    lon = colLL[1].number_input("経度", value=float(lon_q) if lon_q else float(profile.get("home_lon") or 139.76), step=0.01, format="%.5f", key="wx_lon")
-
-    if st.button("📍 現在地を取得（位置情報を許可）", key="wx_geo"):
-        st.markdown("""
-        <script>
-        (function(){
-          if (!navigator.geolocation) { alert("ブラウザが位置情報に未対応です"); return; }
-          navigator.geolocation.getCurrentPosition(function(pos){
-            const lat = pos.coords.latitude.toFixed(5);
-            const lon = pos.coords.longitude.toFixed(5);
-            const url = new URL(window.location.href);
-            url.searchParams.set('lat', lat);
-            url.searchParams.set('lon', lon);
-            window.location.href = url.toString();
-          }, function(err){
-            alert("位置情報を取得できませんでした: " + err.message);
-          }, {enableHighAccuracy:true, timeout:8000, maximumAge:0});
-        })();
-        </script>
-        """, unsafe_allow_html=True)
-
-    if st.button("保存（位置）", key="wx_save"):
-        save_profile(city=city, home_lat=float(lat), home_lon=float(lon))
-        st.success("保存しました")
-
-    data = fetch_open_meteo(lat, lon)
-    if data and "daily" in data:
-        st.info(weather_tip(data["daily"]))
-    else:
-        st.warning("天気が取得できませんでした。")
+                    st.success("保存しました")
 
 # ===== プロフィール =====
 with tabProfile:
-    st.subheader("👤 体格・パーソナルカラー設定")
     colp = st.columns(2)
-    season = colp[0].selectbox("PCシーズン", ["未設定","spring","summer","autumn","winter"],
+    season = colp[0].selectbox("PC", ["未設定","spring","summer","autumn","winter"],
                                index=(["未設定","spring","summer","autumn","winter"].index(profile.get("season")) if profile.get("season") else 0),
                                key="prof_season")
-    body_shape = colp[1].selectbox("体格タイプ", ["未設定","straight","wave","natural"],
+    body_shape = colp[1].selectbox("体格", ["未設定","straight","wave","natural"],
                                    index=(["未設定","straight","wave","natural"].index(profile.get("body_shape")) if profile.get("body_shape") else 0),
                                    key="prof_body")
-    height = st.number_input("身長（cm / 任意）", min_value=120.0, max_value=220.0, step=0.5,
+    height = st.number_input("身長(cm)", min_value=120.0, max_value=220.0, step=0.5,
                              value=float(profile.get("height_cm") or 165.0), key="prof_height")
-
-    if st.button("保存する", key="prof_save"):
+    if st.button("保存", key="prof_save"):
         save_profile(season=None if season=="未設定" else season,
                      body_shape=None if body_shape=="未設定" else body_shape,
                      height_cm=float(height))
-        st.success("プロフィールを保存しました。AI提案に反映されます。")
-
-st.caption("※ use_container_width で警告解消 / URL取込は ZOZO/UNIQLO を含む多くのサイトの og:image/twitter:image/JSON-LD に対応。")
+        st.success("保存しました")
