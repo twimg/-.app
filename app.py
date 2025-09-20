@@ -1,10 +1,4 @@
-# app.py — Outf!ts (hybrid classifier + precise color + dense UI)
-# - 上/下分類：面積・エッジ分布・明度/彩度・デニム検知の多数決
-# - 主色抽出：背景除去後、Lab空間K-means（numpy）で高精度化
-# - 記録：上半分/下半分から別々に色抽出
-# - クローゼット（写真）：判定領域の色を採用
-# - UI：コンパクト表示トグル＋列数選択（1〜3列）で濃密表示
-# - 既存機能（削除、AIスコア、オンライン提案等）は維持
+# app.py — Outf!ts (fix NameError + finer classification/color + grouped list)
 
 import streamlit as st
 import pandas as pd, numpy as np
@@ -193,7 +187,7 @@ def get_usage_stats():
             if (iid not in last_used) or (created_at > last_used[iid]): last_used[iid] = created_at
     return use_count, last_used
 
-# ---------- セッションに画像を保持 ----------
+# ---------- セッション保持アップローダ ----------
 def persistent_uploader(label: str, key: str, types=("jpg","jpeg","png","webp")):
     up = st.file_uploader(label, type=list(types), key=f"{key}_uploader")
     if up is not None:
@@ -251,111 +245,122 @@ def hex_family(hx):
     if 290<=hue<330: return "magenta"
     return "red"
 
-# ---------- sRGB -> Lab（D65） & K-Means ----------
+def adjust_harmony(hx, mode="complement", delta=30):
+    """★ NameError の原因：この関数を入れ忘れていました。"""
+    r,g,b=[v/255 for v in hex_to_rgb(hx)]
+    h,s,v=colorsys.rgb_to_hsv(r,g,b)
+    def wrap(deg): return ((h*360+deg)%360)/360
+    hs = [wrap(180)] if mode=="complement" else ([wrap(+delta),wrap(-delta)] if mode=="analogous" else [wrap(+120),wrap(-120)])
+    outs=[]
+    for hh in hs:
+        rr,gg,bb=colorsys.hsv_to_rgb(hh,s,v); outs.append(rgb_to_hex((int(rr*255),int(gg*255),int(bb*255))))
+    return outs
+
+# ---------- sRGB→Lab & K-Means（色抽出を高精度化） ----------
 def _srgb_to_xyz(arr):
-    # arr: [...,3] in 0..1
     a = np.where(arr <= 0.04045, arr/12.92, ((arr+0.055)/1.055)**2.4)
     M = np.array([[0.4124564,0.3575761,0.1804375],
                   [0.2126729,0.7151522,0.0721750],
                   [0.0193339,0.1191920,0.9503041]])
     return np.tensordot(a, M.T, axes=1)
-
 def _xyz_to_lab(xyz):
-    # Reference white D65
     Xn,Yn,Zn = 0.95047, 1.00000, 1.08883
     x = xyz[...,0]/Xn; y = xyz[...,1]/Yn; z = xyz[...,2]/Zn
     def f(t): return np.where(t>0.008856, np.cbrt(t), 7.787*t+16/116)
     fx,fy,fz = f(x),f(y),f(z)
-    L = 116*fy - 16
-    a = 500*(fx - fy)
-    b = 200*(fy - fz)
+    L = 116*fy - 16; a = 500*(fx - fy); b = 200*(fy - fz)
     return np.stack([L,a,b], axis=-1)
-
-def rgb_to_lab_u8(pix): # pix: [N,3] uint8
+def rgb_to_lab_u8(pix):
     arr = pix.astype(np.float32)/255.0
     return _xyz_to_lab(_srgb_to_xyz(arr))
-
 def kmeans_lab(pixels_lab, k=4, iters=12, seed=42):
-    # pixels_lab: [N,3]
     rng = np.random.default_rng(seed)
-    # kmeans++ init
     cent = np.empty((k,3), dtype=np.float32)
-    idx = rng.integers(0, len(pixels_lab))
-    cent[0] = pixels_lab[idx]
+    idx = rng.integers(0, len(pixels_lab)); cent[0] = pixels_lab[idx]
     d2 = np.full(len(pixels_lab), np.inf, dtype=np.float32)
     for i in range(1,k):
         d2 = np.minimum(d2, np.sum((pixels_lab - cent[i-1])**2, axis=1))
         probs = d2 / np.sum(d2)
         cent[i] = pixels_lab[rng.choice(len(pixels_lab), p=probs)]
     for _ in range(iters):
-        # assign
-        dist = np.sum((pixels_lab[:,None,:]-cent[None,:,:])**2, axis=2)  # [N,k]
+        dist = np.sum((pixels_lab[:,None,:]-cent[None,:,:])**2, axis=2)
         lab = np.argmin(dist, axis=1)
-        # update
         for j in range(k):
             mask = (lab==j)
             if np.any(mask):
                 cent[j] = pixels_lab[mask].mean(axis=0)
     return cent, lab
 
+def _hsv_from_rgb(arrf):
+    r,g,b = arrf[...,0],arrf[...,1],arrf[...,2]
+    mx = np.max(arrf,axis=2); mn = np.min(arrf,axis=2); diff = mx-mn
+    h = np.zeros_like(mx)
+    mask = diff!=0
+    r2 = ((mx==r) & mask); g2 = ((mx==g) & mask); b2 = ((mx==b) & mask)
+    h[r2] = (60*((g-b)/diff)%360)[r2]
+    h[g2] = (60*((b-r)/diff)+120)[g2]
+    h[b2] = (60*((r-g)/diff)+240)[b2]
+    s = np.where(mx==0, 0, diff/mx); v = mx
+    return h, s, v
+
 def main_color_from_region(img:Image.Image, region:str)->str:
-    # region: "upper" or "lower"
     w,h = img.size
-    if region=="upper":
-        crop = img.crop((0,0,w,h//2))
-    else:
-        crop = img.crop((0,h//2,w,h))
-    small = crop.copy()
-    small.thumbnail((220,220))
+    crop = img.crop((0,0,w,h//2)) if region=="upper" else img.crop((0,h//2,w,h))
+    small = crop.copy(); small.thumbnail((220,220))
     arr = np.asarray(small).astype(np.uint8)
-    # 背景除去マスク（低彩度の白/壁は除外）
     arrf = arr.astype(np.float32)/255.0
+    # 背景除去 + 中心重み
+    hgt,wid = arr.shape[0], arr.shape[1]
+    yy,xx = np.mgrid[0:hgt,0:wid]
+    cx,cy = wid/2, hgt/2
+    sigma = max(hgt,wid)/3.2
+    weights = np.exp(-(((xx-cx)**2 + (yy-cy)**2)/(2*sigma*sigma))).astype(np.float32)
     cmax = np.max(arrf, axis=2); cmin = np.min(arrf, axis=2)
     sat  = (cmax - cmin); val = cmax
     mask = ((sat > 0.10) | (val < 0.85)) & (val < 0.98)
-    pix = arr[mask]
-    if len(pix) < 50:   # マスクが小さすぎる場合は全体
-        pix = arr.reshape(-1,3)
+    pix = arr[mask]; wv = weights[mask]
+    if len(pix) < 50:
+        pix = arr.reshape(-1,3); wv = weights.reshape(-1)
     lab = rgb_to_lab_u8(pix)
     k = 4 if len(pix) > 400 else 3
     cent, labidx = kmeans_lab(lab, k=k, iters=10)
-    # 白/黒に近すぎるクラスは下げる
+    # 白/黒ペナルティ + 中心重みでクラス選択
     def penalty(c):
-        L,a,b = c
-        pen = 0.0
-        if L>92: pen += 0.7   # 白っぽい
-        if L<20: pen += 0.4   # 真っ黒
+        L,a,b = c; pen = 0.0
+        if L>92: pen += 0.7
+        if L<20: pen += 0.4
         return pen
     sizes=[]
     for j in range(k):
-        n = int(np.sum(labidx==j))
-        sizes.append((n*(1.0-penalty(cent[j])), j))
-    sizes.sort(reverse=True)
-    best_j = sizes[0][1]
-    # Lab→RGB（近似で戻す）
-    # ここではクラスタ内のRGB平均を使う
-    rgb_mean = pix[labidx==best_j].mean(axis=0).astype(np.uint8)
+        wsum = float(wv[labidx==j].sum())
+        sizes.append((wsum*(1.0-penalty(cent[j])), j))
+    sizes.sort(reverse=True); best_j = sizes[0][1]
+    sel = pix[labidx==best_j]; wsel = wv[labidx==best_j][:,None]
+    rgb_mean = (sel*wsel).sum(axis=0)/max(1e-6,wsel.sum())
     return rgb_to_hex(tuple(int(x) for x in rgb_mean))
 
-# ---------- ハイブリッド 上/下 判定 ----------
+# ---------- ハイブリッド上/下判定（肌色検知を追加） ----------
 def _edge_histogram(img:Image.Image):
     a = np.asarray(img.resize((128,128))).astype(np.float32)/255.0
     gyx = np.abs(np.diff(a, axis=1, prepend=a[:,:1,:])).mean(axis=2)
     gyy = np.abs(np.diff(a, axis=0, prepend=a[:1,:,:])).mean(axis=2)
     edge = (gyx+gyy)/2.0
-    return edge.mean(axis=1)  # row-wise
+    return edge.mean(axis=1)
 
 def _clothing_mask(arrf):
     cmax = np.max(arrf, axis=2); cmin = np.min(arrf, axis=2)
     sat  = (cmax - cmin); val = cmax
-    # 服になりやすい条件 + 背景白抑制
     return ((sat > 0.12) | (val < 0.75)) & (val < 0.98)
+
+def _skin_score(arrf):
+    # HSVで肌色レンジ（ざっくり）：H 0–50 or 330–360, S 0.15–0.68, V 0.2–0.95
+    H,S,V = _hsv_from_rgb(arrf)
+    mask = ((H<=50) | (H>=330)) & (S>=0.15) & (S<=0.68) & (V>=0.20) & (V<=0.95)
+    return float(mask.mean())
 
 def classify_top_or_bottom(img:Image.Image)->str:
     w,h = img.size
-    upper = img.crop((0,0,w,h//2))
-    lower = img.crop((0,h//2,w,h))
-    # 1) 面積
+    upper = img.crop((0,0,w,h//2)); lower = img.crop((0,h//2,w,h))
     def area_score(region):
         arrf = np.asarray(region.resize((160,160))).astype(np.float32)/255.0
         mask = _clothing_mask(arrf)
@@ -363,55 +368,37 @@ def classify_top_or_bottom(img:Image.Image)->str:
         gyy = np.abs(np.diff(arrf, axis=0, prepend=arrf[:1,:,:])).mean(axis=2)
         edge = (gyx+gyy)/2.0
         return float(mask.mean() + 0.12*edge[mask].mean() if mask.any() else mask.mean())
-    s_top = area_score(upper)
-    s_bot = area_score(lower)
+    s_top = area_score(upper); s_bot = area_score(lower)
     vote_top = 0; vote_bot = 0
-    if s_bot >= s_top*1.20: vote_bot += 1   # 下が明確に多い時だけボトムに
+    if s_bot >= s_top*1.20: vote_bot += 1
     elif s_top >= s_bot*1.05: vote_top += 1
-    # 2) エッジピーク位置（首/肩あたりにエッジが出やすい）
-    eh = _edge_histogram(img)
-    peak_row = np.argmax(eh)/len(eh)  # 0..1
+    eh = _edge_histogram(img); peak_row = np.argmax(eh)/len(eh)
     if 0.18 <= peak_row <= 0.42: vote_top += 1
     if 0.55 <= peak_row <= 0.90: vote_bot += 1
-    # 3) 明るさ/彩度傾向（上が明る・彩ある→トップ票、下が暗青→ボトム票）
     def light_sat(region):
         arrf = np.asarray(region.resize((160,160))).astype(np.float32)/255.0
         cmax = np.max(arrf, axis=2); cmin = np.min(arrf, axis=2)
         sat  = (cmax - cmin); val = cmax
         return float(val.mean()), float(sat.mean())
-    vt,stt = light_sat(upper)
-    vb,stb = light_sat(lower)
+    vt,stt = light_sat(upper); vb,stb = light_sat(lower)
     if vt > vb+0.03 and stt >= stb-0.01: vote_top += 1
-    # デニム/ダーク検知
+    # デニム/ダーク検知（下に多いとボトム票）
     def denim_like(region):
-        arr = np.asarray(region.resize((120,120))).astype(np.float32)/255.0
-        h = np.zeros(arr.shape[:2]); s = np.zeros_like(h); v = np.zeros_like(h)
-        r,g,b = arr[...,0], arr[...,1], arr[...,2]
-        for i in range(arr.shape[0]):
-            for j in range(arr.shape[1]):
-                rr,gg,bb = r[i,j], g[i,j], b[i,j]
-                mx, mn = max(rr,gg,bb), min(rr,gg,bb)
-                if mx==mn:
-                    hh=0
-                elif mx==rr:
-                    hh=(60*((gg-bb)/(mx-mn)) + 360)%360
-                elif mx==gg:
-                    hh=60*((bb-rr)/(mx-mn)) + 120
-                else:
-                    hh=60*((rr-gg)/(mx-mn)) + 240
-                h[i,j]=hh; s[i,j]=(0 if mx==0 else (mx-mn)/mx); v[i,j]=mx
-        mask = (h>=200)&(h<=255)&(v<0.55)
+        arrf = np.asarray(region.resize((120,120))).astype(np.float32)/255.0
+        H,S,V = _hsv_from_rgb(arrf)
+        mask = (H>=200)&(H<=255)&(V<0.55)
         return float(mask.mean())
     if denim_like(lower) > 0.06: vote_bot += 1
-    # 4) 最終決定
+    # 肌色が上部30%に見えるとトップ票
+    up_small = np.asarray(img.resize((160,160))).astype(np.float32)/255.0
+    up_band = up_small[:48,:,:]
+    if _skin_score(up_band) > 0.04: vote_top += 1
     return "ボトムス" if vote_bot > vote_top else "トップス"
 
-# ---------- URL取込（メタ/JSON-LD） ----------
+# ---------- URL取込 ----------
 UA = {"User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1","Accept-Language":"ja,en;q=0.8"}
-
 def _decode_best(r):
-    b = r.content
-    cands = []
+    b = r.content; cands=[]
     if getattr(r, "encoding", None): cands.append(r.encoding)
     if getattr(r, "apparent_encoding", None): cands.append(r.apparent_encoding)
     cands += ["utf-8","cp932","shift_jis","euc-jp"]
@@ -426,11 +413,9 @@ def _decode_best(r):
             return s
         except: continue
     return b.decode("utf-8", errors="ignore")
-
 def _meta(content, name):
     m=re.search(rf'<meta[^>]+(?:property|name)=["\']{re.escape(name)}["\'][^>]+content=["\']([^"\']+)["\']', content, re.I)
     return ihtml.unescape(m.group(1)) if m else None
-
 def _jsonld_image(content):
     for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', content, re.I|re.S):
         try:
@@ -443,7 +428,6 @@ def _jsonld_image(content):
                 img=data["image"]; return img[0] if isinstance(img, list) else img
         except: pass
     return None
-
 def fetch_from_page(url:str):
     try:
         r=requests.get(url, timeout=10, headers=UA)
@@ -467,7 +451,7 @@ def fetch_from_page(url:str):
     except:
         return None, None, None
 
-# ---- テキスト/画像からの推定（補助） ----
+# ---- テキスト/素材/季節 推定（補助） ----
 CAT_MAP = {
     "トップス":["tシャツ","tee","シャツ","ブラウス","スウェット","パーカー","ニット","セーター","カーディガン","トップス","pullover","hoodie","sweat","blouse"],
     "ボトムス":["パンツ","デニム","ジーンズ","スラックス","トラウザー","スカート","ショーツ","ハーフパンツ","shorts","trousers","skirt","jeans"],
@@ -494,7 +478,7 @@ def guess_season_from_text(text:str)->str|None:
     if any(k in t for k in ["秋冬","fw","winter","秋/冬"]): return "winter"
     return None
 
-# ---------- 評価系（既存） ----------
+# ---------- 評価（既存） ----------
 SEASON_PALETTES = {
     "spring": ["#ffb3a7","#ffd28c","#ffe680","#b7e07a","#8ed1c8","#ffd7ef","#f5deb3"],
     "summer": ["#c8cbe6","#b0c4de","#c3b1e1","#9fd3c7","#d8d8d8","#e6d5c3","#a3bcd6"],
@@ -509,13 +493,10 @@ def palette_distance(hexstr, user_season):
         d=(px[0]-rr)**2+(px[1]-gg)**2+(px[2]-bb)**2
         if d<best: best=d
     return sqrt(best)
-
 def rgb_dist(h1,h2):
     r1,g1,b1=hex_to_rgb(h1); r2,g2,b2=hex_to_rgb(h2)
     return sqrt((r1-r2)**2+(g1-g2)**2+(b1-b2)**2)
-
 MAXD = sqrt(255**2*3)
-
 def harmony_score(top_hex, others):
     if not others: return 0
     ds=[]
@@ -526,7 +507,6 @@ def harmony_score(top_hex, others):
         ds.append(s)
     if not ds: return 0
     return 40 * (sum(ds)/len(ds))
-
 def palette_score(hexes, user_season):
     if not user_season: return 15
     ss=[]
@@ -535,21 +515,17 @@ def palette_score(hexes, user_season):
         s = max(0.0, 1.0 - d/MAXD)
         ss.append(s)
     return 30 * (sum(ss)/len(ss)) if ss else 0
-
 def climate_bonus(material, heat, humidity, rainy):
-    m=(material or "").lower()
-    s=0
+    m=(material or "").lower(); s=0
     if heat in ["暑い","猛暑"] and any(k in m for k in ["linen","リネン","cotton","コットン","メッシュ","ドライ"]): s+=1
     if heat in ["寒い"] and any(k in m for k in ["wool","ウール","ダウン","中綿","フリース","キルト"]): s+=1
     if humidity=="湿度高い" and any(k in m for k in ["ドライ","吸汗","速乾","メッシュ","ナイロン","nylon"]): s+=1
     if humidity=="乾燥" and any(k in m for k in ["ウール","ニット","フリース"]): s+=1
     if rainy and any(k in m for k in ["ナイロン","nylon","ゴア","gore","防水","撥水"]): s+=1
     return s
-
 def purpose_match(notes, want):
     if not want or want=="指定なし": return 0
-    n=(notes or "")
-    pts=0
+    n=(notes or ""); pts=0
     if want=="通勤":     pts += any(k in n for k in ["ジャケット","シャツ","スラックス","革靴","きれいめ"])
     if want=="デート":   pts += any(k in n for k in ["綺麗め","スカート","ワンピ","ヒール","上品"])
     if want=="カジュアル":pts += any(k in n for k in ["デニム","スニーカー","カジュアル","リラックス"])
@@ -557,11 +533,9 @@ def purpose_match(notes, want):
     if want=="フォーマル":pts += any(k in n for k in ["ネクタイ","セットアップ","ドレス","革靴"])
     if want=="雨の日":  pts += any(k in n for k in ["撥水","防水","ゴア","レイン","ナイロン"])
     return int(bool(pts))
-
 def body_shape_bonus(notes, body, category):
     if not body: return 0
-    n=(notes or "").lower()
-    b=body
+    n=(notes or "").lower(); b=body
     if b=="straight":
         if category=="ボトムス" and any(k in n for k in ["テーパード","センタープレス","ストレート"]): return 1
         if category in ["トップス","アウター"] and any(k in n for k in ["vネック","襟","ジャケット","構築的"]): return 1
@@ -571,24 +545,16 @@ def body_shape_bonus(notes, body, category):
     if b=="natural":
         if any(k in n for k in ["ワイド","オーバーサイズ","ドロップショルダー","リネン","ツイード"]): return 1
     return 0
-
 def evaluate_outfit(outfit, season, body_shape, want, heat, humidity, rainy):
     items = [outfit[k] for k in ["top","bottom","shoes","bag"] if outfit.get(k)]
     hexes = [it[3] for it in items if it]
     top_hex = outfit["top"][3] if outfit.get("top") else (hexes[0] if hexes else "#2f2f2f")
-
     sc_harmony = harmony_score(top_hex, [h for h in hexes[1:]])
     sc_palette = palette_score(hexes, season)
-    clim = sum([climate_bonus(it[5], heat, humidity, rainy) for it in items])
-    sc_climate = min(clim, 4) / 4 * 20
-    purp = sum([purpose_match(it[7], want) for it in items])
-    sc_purpose = min(purp, 2) / 2 * 10
-    bodyb = sum([body_shape_bonus(it[7], body_shape, it[2]) for it in items])
-    sc_body = min(bodyb, 3) / 3 * 10
-
-    total = round(sc_harmony + sc_palette + sc_climate + sc_purpose + sc_body, 1)
-    total = max(0.0, min(100.0, total))
-
+    clim = sum([climate_bonus(it[5], heat, humidity, rainy) for it in items]); sc_climate = min(clim, 4) / 4 * 20
+    purp = sum([purpose_match(it[7], want) for it in items]); sc_purpose = min(purp, 2) / 2 * 10
+    bodyb = sum([body_shape_bonus(it[7], body_shape, it[2]) for it in items]); sc_body = min(bodyb, 3) / 3 * 10
+    total = round(max(0.0, min(100.0, sc_harmony + sc_palette + sc_climate + sc_purpose + sc_body)), 1)
     goods=[]; bads=[]
     if sc_harmony >= 28: goods.append("トップと他アイテムの**色相バランス**が良い")
     else: bads.append("配色の一体感が弱め。**補色/類似色**を意識するとまとまりやすい")
@@ -600,23 +566,14 @@ def evaluate_outfit(outfit, season, body_shape, want, heat, humidity, rainy):
     else: bads.append("TPO要素が弱い")
     if sc_body >= 6: goods.append("体型に合う**シルエット**/ディテール")
     else: bads.append("体型補正が弱め")
-
     comp = adjust_harmony(top_hex, "complement")[0]
     ana  = adjust_harmony(top_hex, "analogous")
     tri  = adjust_harmony(top_hex, "triadic")
-    suggest = [comp, ana[0], tri[0]]
-    suggest = sorted(suggest, key=lambda h: palette_distance(h, season))
-    def jp_name(hx):
-        name = nearest_css_name(hx)
-        return JP_COLOR.get(name, name)
+    suggest = sorted([comp, ana[0], tri[0]], key=lambda h: palette_distance(h, season))
+    def jp_name(hx): return JP_COLOR.get(nearest_css_name(hx), nearest_css_name(hx))
     suggestions = [{"hex":h, "name":jp_name(h)} for h in suggest]
-    breakdown = {
-        "Harmony(40)": round(sc_harmony,1),
-        "PC Fit(30)": round(sc_palette,1),
-        "Climate(20)": round(sc_climate,1),
-        "Purpose(10)": round(sc_purpose,1),
-        "Body(10)": round(sc_body,1),
-    }
+    breakdown = {"Harmony(40)": round(sc_harmony,1),"PC Fit(30)": round(sc_palette,1),
+                 "Climate(20)": round(sc_climate,1),"Purpose(10)": round(sc_purpose,1),"Body(10)": round(sc_body,1)}
     return total, goods, bads, suggestions, breakdown
 
 # ---------- オンライン提案 ----------
@@ -637,8 +594,7 @@ def shop_suggestions(category:str, base_hex:str, season:str|None):
     out=[]
     for site, base in SHOP_LINKS.items():
         if site=="ZOZOTOWN":
-            q = quote_plus(f"site:zozo.jp {kw}")
-            url = base + q
+            q = quote_plus(f"site:zozo.jp {kw}"); url = base + q
         elif site=="Rakuten":
             url = base + quote_plus(kw) + "/"
         else:
@@ -650,8 +606,7 @@ def shop_suggestions(category:str, base_hex:str, season:str|None):
 init_db()
 profile = load_profile()
 
-# コンパクト表示トグル（全体の密度を上げる）
-compact = st.toggle("コンパクト表示", value=True, help="カード/余白を詰めて情報密度を上げます。")
+compact = st.toggle("コンパクト表示", value=True, help="情報密度を上げます。")
 st.markdown("<div class='compact'>" if compact else "<div>", unsafe_allow_html=True)
 
 st.title("Outf!ts")
@@ -663,10 +618,7 @@ SIL_BOTTOM = ["ストレート","ワイド/フレア","スキニー/テーパー
 # ===== 記録 =====
 with tab1:
     d = st.date_input("日付", value=pd.Timestamp.today(), key="rec_date")
-
-    # 画像保持アップローダ
     img_bytes = persistent_uploader("写真（カメラ可）", key="rec_photo")
-
     colA, colB = st.columns(2)
     top_sil = colA.selectbox("トップ", SIL_TOP, index=0, key="rec_top_sil")
     bottom_sil = colB.selectbox("ボトム", SIL_BOTTOM, index=0, key="rec_bottom_sil")
@@ -676,7 +628,6 @@ with tab1:
     if img_bytes:
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         st.image(img, use_container_width=True)
-        # 上下別に主色抽出
         auto_top = main_color_from_region(img, "upper")
         auto_bottom = main_color_from_region(img, "lower")
         auto_colors = [auto_top, auto_bottom]
@@ -755,18 +706,14 @@ with tabCloset:
         if img_bytes:
             img_i = Image.open(io.BytesIO(img_bytes)).convert("RGB")
             st.image(img_i, use_container_width=True)
-            # ハイブリッド分類
             cat_guess = classify_top_or_bottom(img_i)
-            # 判定領域から主色抽出
             region = "upper" if cat_guess=="トップス" else "lower"
             color_auto = main_color_from_region(img_i, region)
-            # 推定季節/素材（簡易）
             season_guess = None
             material_guess = "コットン" if hex_luma(color_auto)>150 else "ウール/ニット"
             cname = JP_COLOR.get(nearest_css_name(color_auto), "カラー")
             name_suggest = f"{cname} {('Tシャツ' if cat_guess=='トップス' else 'パンツ' if cat_guess=='ボトムス' else cat_guess)}"
             st.caption("自動：カテゴリ/主色（領域別）/素材（簡易）")
-
             st.markdown(f"<span class='swatch' style='background:{color_auto}'></span> {color_auto}", unsafe_allow_html=True)
 
         colN = st.columns(2)
@@ -813,8 +760,7 @@ with tabCloset:
         if img_bytes:
             img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
             st.image(img, use_container_width=True)
-            # URLからは画像全体から主色（背景抑制あり）
-            color_guess = main_color_from_region(img, "upper")  # 単品写真は上側でも差が出にくいが背景抑制で精度向上
+            color_guess = main_color_from_region(img, "upper")
             st.markdown(f"<span class='swatch' style='background:{color_guess}'></span> {color_guess}", unsafe_allow_html=True)
 
         colU = st.columns(2)
@@ -822,7 +768,7 @@ with tabCloset:
         category_url = colU[1].selectbox("カテゴリ", ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"],
                                          index=(["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"].index(cat_from_text) if cat_from_text in ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"] else 0),
                                          key=f"cl_category_url_{seed}")
-        color_url = st.color_picker("色", color_guess, key=f"cl_color_url_{seed}")
+        color_url = colU[0].color_picker("色", color_guess, key=f"cl_color_url_{seed}")
 
         colU2 = st.columns(2)
         material_url = colU2[0].text_input("素材", value=mat_from_text, key=f"cl_material_url_{seed}")
@@ -836,60 +782,62 @@ with tabCloset:
                      material_url, img_bytes, notes_url)
             st.success("追加しました")
 
-    # ---------- 一覧 / 編集 / 削除 ----------
+    # ---------- グループごと一覧 / 編集 / 削除 ----------
     st.markdown("---")
-    st.subheader("一覧 / 編集")
+    st.subheader("クローゼット一覧（カテゴリ別）")
 
     frow = st.columns([2,3,1])
-    filt = frow[0].selectbox("絞り込み", ["すべて","トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"], index=0, key="cl_filter")
-    q = frow[1].text_input("キーワード検索（名前/メモ）", key="cl_query", placeholder="例：ネイビー, 撥水, オフィス など")
-    per_row = int(frow[2].selectbox("列数", [1,2,3], index=1, help="画面密度を変更"))
+    q = frow[1].text_input("検索（名前/メモ）", key="cl_query", placeholder="例：ネイビー, 撥水, オフィス など")
+    per_row = int(frow[2].selectbox("列数", [1,2,3], index=2, help="画面密度を変更"))
 
-    sort_key = st.selectbox("並び替え", ["新着順","使用回数が多い順","最終着用が新しい順","名前 A→Z"], index=0, key="cl_sort")
-
-    items_raw = list_items(filt)
-    if q:
-        ql = q.lower()
-        items_raw = [row for row in items_raw if (row[1] and ql in row[1].lower()) or (row[7] and ql in row[7].lower())]
     use_count, last_used = get_usage_stats()
     def _last_dt(iid): return last_used.get(iid, "")
-    if sort_key == "使用回数が多い順":
-        items_raw = sorted(items_raw, key=lambda r: use_count.get(r[0], 0), reverse=True)
-    elif sort_key == "最終着用が新しい順":
-        items_raw = sorted(items_raw, key=lambda r: _last_dt(r[0]), reverse=True)
-    elif sort_key == "名前 A→Z":
-        items_raw = sorted(items_raw, key=lambda r: (r[1] or "").lower())
-    else:
-        items_raw = sorted(items_raw, key=lambda r: r[0], reverse=True)
+    all_items = list_items("すべて")
+    if q:
+        ql = q.lower()
+        all_items = [r for r in all_items if (r[1] and ql in r[1].lower()) or (r[7] and ql in r[7].lower())]
 
-    st.markdown("### ギャラリー")
-    if not items_raw:
-        st.info("アイテムがありません。上で追加してください。")
-    else:
-        for i in range(0, len(items_raw), per_row):
-            cols = st.columns(per_row)
-            for col, row in zip(cols, items_raw[i:i+per_row]):
-                iid, nm, cat, hx, sp, mat, imgb, nts = row
-                worn = use_count.get(iid, 0)
-                last = last_used.get(iid)
-                last_txt = pd.to_datetime(last).strftime("%Y-%m-%d") if last else "—"
-                with col:
-                    st.markdown("<div class='card'>", unsafe_allow_html=True)
-                    if imgb:
-                        try: st.image(Image.open(io.BytesIO(imgb)), use_container_width=True)
-                        except: st.markdown("<div style='width:100%;aspect-ratio:1/1;border:1px dashed #ccc;border-radius:8px;display:flex;align-items:center;justify-content:center;'>画像表示不可</div>", unsafe_allow_html=True)
-                    else:
-                        st.markdown("<div style='width:100%;aspect-ratio:1/1;border:1px dashed #ccc;border-radius:8px;display:flex;align-items:center;justify-content:center;'>画像なし</div>", unsafe_allow_html=True)
-                    st.markdown(f"**{nm or '（名称未設定）'}**")
-                    st.markdown(f"<span class='pill'>{cat}</span> <span class='pill'>{sp or '季節指定なし'}</span> <span class='pill'>{mat or '素材不明'}</span>", unsafe_allow_html=True)
-                    st.markdown(f"<div class='cap'><span class='mini' style='background:{hx or '#2f2f2f'}'></span>色: {hx or '-'}</div>", unsafe_allow_html=True)
-                    st.markdown(f"<div class='cap'>使用回数: <b>{worn}</b>／最終着用: {last_txt}</div>", unsafe_allow_html=True)
-                    if st.button("編集を開く", key=f"open_edit_{iid}"):
-                        st.session_state[f"open_exp_{iid}"] = True
-                    st.markdown("</div>", unsafe_allow_html=True)
+    groups = {
+        "トップス": ["トップス","ワンピース"],
+        "ボトムス": ["ボトムス"],
+        "アウター": ["アウター"],
+        "小物": ["シューズ","バッグ"],
+        "アクセサリー": ["アクセ"],
+    }
+
+    def render_card(row, col):
+        iid, nm, cat, hx, sp, mat, imgb, nts = row
+        worn = use_count.get(iid, 0)
+        last = last_used.get(iid)
+        last_txt = pd.to_datetime(last).strftime("%Y-%m-%d") if last else "—"
+        with col:
+            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            if imgb:
+                try: st.image(Image.open(io.BytesIO(imgb)), use_container_width=True)
+                except: st.markdown("<div style='width:100%;aspect-ratio:1/1;border:1px dashed #ccc;border-radius:8px;display:flex;align-items:center;justify-content:center;'>画像表示不可</div>", unsafe_allow_html=True)
+            else:
+                st.markdown("<div style='width:100%;aspect-ratio:1/1;border:1px dashed #ccc;border-radius:8px;display:flex;align-items:center;justify-content:center;'>画像なし</div>", unsafe_allow_html=True)
+            st.markdown(f"**{nm or '（名称未設定）'}**")
+            st.markdown(f"<span class='pill'>{cat}</span> <span class='pill'>{sp or '季節指定なし'}</span> <span class='pill'>{mat or '素材不明'}</span>", unsafe_allow_html=True)
+            st.markdown(f"<div class='cap'><span class='mini' style='background:{hx or '#2f2f2f'}'></span>色: {hx or '-'}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='cap'>使用回数: <b>{worn}</b>／最終着用: {last_txt}</div>", unsafe_allow_html=True)
+            if st.button("編集を開く", key=f"open_edit_{iid}"):
+                st.session_state[f"open_exp_{iid}"] = True
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    for gname, cats in groups.items():
+        items_g = [r for r in all_items if r[2] in cats]
+        with st.expander(f"{gname}（{len(items_g)}）", expanded=True):
+            if not items_g:
+                st.caption("該当なし")
+            else:
+                for i in range(0, len(items_g), per_row):
+                    cols = st.columns(per_row)
+                    for col, row in zip(cols, items_g[i:i+per_row]):
+                        render_card(row, col)
 
     st.markdown("### 編集 / 削除")
-    for row in items_raw:
+    for row in all_items:
         iid, nm, cat, hx, sp, mat, imgb, nts = row
         expanded = st.session_state.get(f"open_exp_{iid}", False)
         with st.expander(f"{nm}（{cat}）", expanded=expanded):
@@ -1014,7 +962,6 @@ with tabAI:
                 st.markdown("#### 買うべき色（トップ基準の提案）")
                 st.markdown("".join([f"<span class='swatch' style='background:{s['hex']}'></span> {s['name']} ({s['hex']})  " for s in suggestions]), unsafe_allow_html=True)
 
-                # 不足カテゴリのオンライン提案
                 missing=[]
                 if outfit["bottom"] is None: missing.append("ボトムス")
                 if outfit["shoes"]  is None: missing.append("シューズ")
