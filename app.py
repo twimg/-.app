@@ -1,10 +1,9 @@
-# app.py — Outf!ts (full)
-# - 画像つきAIおすすめ（トップ/ボトム/靴/バッグをカードで表示）
-# - AIが100点満点で自動採点（色調和/PC適合/気候/用途/体型の5軸）
-# - Good/Bad コメント & 「買うべき色」提案
-# - URL取込は正規表現＋JSON-LDで文字化け対策（bs4不要）
-# - 写真アップで色/カテゴリ/素材/得意シーズン/名前を推定
-# - クローゼットはカード型ギャラリー＋検索/並び替え＋使用回数/最終着用日
+# app.py — Outf!ts (persistent image & area-based category)
+# - 一度選んだ画像をセッションに保持（再実行後も再利用）
+# - 写真にトップ/ボトムが両方写る場合、"写っている面積が多い方" を自動採用
+# - 画像つきAIおすすめ + 100点満点AIスコア + Good/Bad + 買うべき色
+# - URL取込は正規表現＋JSON-LD（bs4不要/文字化け補正）
+# - クローゼットはカードギャラリー＋検索/並び替え＋使用回数/最終着用
 
 import streamlit as st
 import pandas as pd, numpy as np
@@ -140,7 +139,6 @@ def add_item(name, category, color_hex, season_pref, material, img_bytes, notes)
 def list_items(category=None):
     q = "SELECT id,name,category,color_hex,season_pref,material,img,notes FROM items"
     params=[]
-    CL = ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"]
     if category and category!="すべて":
         q += " WHERE category=?"; params=[category]
     q += " ORDER BY id DESC"
@@ -164,7 +162,6 @@ def update_item(iid:int, name, category, color_hex, season_pref, material, img_b
         conn.commit()
 
 def save_coord(top_id, bottom_id, shoes_id, bag_id, ctx:dict, ai_score:float):
-    """rating には 0-100 のAIスコアを整数で保存"""
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute("""INSERT INTO coords(created_at,top_id,bottom_id,shoes_id,bag_id,ctx,score,rating)
@@ -183,6 +180,21 @@ def get_usage_stats():
             use_count[iid] += 1
             if (iid not in last_used) or (created_at > last_used[iid]): last_used[iid] = created_at
     return use_count, last_used
+
+# ---------- セッションに画像を保持 ----------
+def persistent_uploader(label: str, key: str, types=("jpg","jpeg","png","webp")):
+    """
+    file_uploader は再実行でリセットされるため、選択画像のbytesを session_state に保存して保持する。
+    戻り値: bytes | None
+    """
+    up = st.file_uploader(label, type=list(types), key=f"{key}_uploader")
+    if up is not None:
+        st.session_state[f"{key}_bytes"] = up.read()
+    cols = st.columns([4,1])
+    with cols[1]:
+        if st.button("クリア", key=f"{key}_clear", help="選択中の画像をクリア"):
+            st.session_state.pop(f"{key}_bytes", None)
+    return st.session_state.get(f"{key}_bytes")
 
 # ---------- Color utilities ----------
 CSS_COLORS = {
@@ -270,31 +282,29 @@ def palette_distance(hexstr, user_season):
         if d<best: best=d
     return sqrt(best)
 
-# ---------- AI scoring helpers ----------
+# ---------- AI scoring ----------
 def rgb_dist(h1,h2):
     r1,g1,b1=hex_to_rgb(h1); r2,g2,b2=hex_to_rgb(h2)
-    return sqrt((r1-r2)**2+(g1-g2)**2+(b1-b2)**2)  # 0..441.7
+    return sqrt((r1-r2)**2+(g1-g2)**2+(b1-b2)**2)
 
 MAXD = sqrt(255**2*3)  # ≈441.67
 
 def harmony_score(top_hex, others):
-    """0..40"""
     if not others: return 0
     ds=[]
     for hx in others:
         if not hx: continue
         d=rgb_dist(top_hex, hx)
-        s = max(0.0, 1.0 - d/MAXD)  # 0..1 近いほど高い
+        s = max(0.0, 1.0 - d/MAXD)  # 近いほど高い
         ds.append(s)
     if not ds: return 0
     return 40 * (sum(ds)/len(ds))
 
 def palette_score(hexes, user_season):
-    """0..30"""
-    if not user_season: return 15  # 未設定なら中間点
+    if not user_season: return 15
     ss=[]
     for hx in hexes:
-        d = palette_distance(hx, user_season)  # 0..441
+        d = palette_distance(hx, user_season)
         s = max(0.0, 1.0 - d/MAXD)
         ss.append(s)
     return 30 * (sum(ss)/len(ss)) if ss else 0
@@ -336,29 +346,25 @@ def body_shape_bonus(notes, body, category):
     return 0
 
 def evaluate_outfit(outfit, season, body_shape, want, heat, humidity, rainy):
-    """100点満点のAIスコアとGood/Bad、購入色提案"""
     items = [outfit[k] for k in ["top","bottom","shoes","bag"] if outfit.get(k)]
     hexes = [it[3] for it in items if it]
     top_hex = outfit["top"][3] if outfit.get("top") else (hexes[0] if hexes else "#2f2f2f")
 
-    # --- Scores ---
     sc_harmony = harmony_score(top_hex, [h for h in hexes[1:]])
     sc_palette = palette_score(hexes, season)
 
-    # 気候/用途/体型は加点制
     clim = sum([climate_bonus(it[5], heat, humidity, rainy) for it in items])
-    sc_climate = min(clim, 4) / 4 * 20  # 0..20
+    sc_climate = min(clim, 4) / 4 * 20
 
     purp = sum([purpose_match(it[7], want) for it in items])
-    sc_purpose = min(purp, 2) / 2 * 10   # 0..10
+    sc_purpose = min(purp, 2) / 2 * 10
 
     bodyb = sum([body_shape_bonus(it[7], body_shape, it[2]) for it in items])
-    sc_body = min(bodyb, 3) / 3 * 10     # 0..10
+    sc_body = min(bodyb, 3) / 3 * 10
 
     total = round(sc_harmony + sc_palette + sc_climate + sc_purpose + sc_body, 1)
     total = max(0.0, min(100.0, total))
 
-    # --- Good / Bad メッセージ ---
     goods=[]; bads=[]
     if sc_harmony >= 28: goods.append("トップと他アイテムの**色相バランス**が良い")
     else: bads.append("配色の一体感が弱め。**補色/類似色**を意識するとまとまりやすい")
@@ -375,12 +381,10 @@ def evaluate_outfit(outfit, season, body_shape, want, heat, humidity, rainy):
     if sc_body >= 6: goods.append("体型に合う**シルエット**/ディテール")
     else: bads.append("体型補正が弱め。ラインを整えるパターンの採用を検討")
 
-    # --- 買うべき色の提案（トップ基準） ---
     comp = adjust_harmony(top_hex, "complement")[0]
     ana  = adjust_harmony(top_hex, "analogous")
     tri  = adjust_harmony(top_hex, "triadic")
     suggest = [comp, ana[0], tri[0]]
-    # PCに寄せて並べ替え（近い順）
     suggest = sorted(suggest, key=lambda h: palette_distance(h, season))
 
     def jp_name(hx):
@@ -485,13 +489,27 @@ def guess_season_from_text(text:str)->str|None:
     if any(k in t for k in ["秋冬","fw","winter","秋/冬"]): return "winter"
     return None
 
-def pick_top_bottom_from_colors(cols:list[str]):
-    if not cols: return "#2f2f2f","#c9c9c9"
-    bottom = sorted(cols, key=lambda h: hex_luma(h))[0]
-    vivid = [h for h in cols if hex_family(h) not in ("black","white","gray")]
-    top = vivid[0] if vivid else (cols[0] if cols else "#2f2f2f")
-    if top == bottom: bottom = "#c9c9c9"
-    return top, bottom
+# --- 面積ベースのカテゴリ推定（上半分 vs 下半分） ---
+def _clothing_fill_score(img_region: Image.Image) -> float:
+    arr = np.asarray(img_region.resize((128, 128))).astype(np.float32) / 255.0
+    cmax = np.max(arr, axis=2)
+    cmin = np.min(arr, axis=2)
+    sat  = (cmax - cmin)               # 彩度
+    val  = cmax                        # 明度
+    mask = ((sat > 0.12) | (val < 0.70)) & (val < 0.98)
+    gyx = np.abs(np.diff(arr, axis=1, prepend=arr[:,:1,:])).mean(axis=2)
+    gyy = np.abs(np.diff(arr, axis=0, prepend=arr[:1,:,:])).mean(axis=2)
+    edge = (gyx + gyy)/2.0
+    return float(mask.mean() + 0.15*edge[mask].mean() if mask.any() else mask.mean())
+
+def guess_category_from_image(img: Image.Image) -> str:
+    w, h = img.size
+    upper = img.crop((0, 0, w, h//2))
+    lower = img.crop((0, h//2, w, h))
+    s_top = _clothing_fill_score(upper)
+    s_bot = _clothing_fill_score(lower)
+    return "ボトムス" if s_bot >= s_top*1.05 else "トップス"
+
 def guess_season_from_colors(cols:list[str])->str|None:
     if not cols: return None
     hsv=[]
@@ -505,11 +523,15 @@ def guess_season_from_colors(cols:list[str])->str|None:
     if v<0.55 and 20<=hue<=80:              return "autumn"
     if v>0.8 and s>0.6 and (hue<20 or hue>220): return "winter"
     return None
-def guess_category_from_image(img:Image.Image)->str:
-    ar = img.height / max(1,img.width)
-    if ar>=1.4:  return "ボトムス"
-    if ar<=0.9:  return "トップス"
-    return "トップス"
+
+def pick_top_bottom_from_colors(cols:list[str]):
+    if not cols: return "#2f2f2f","#c9c9c9"
+    bottom = sorted(cols, key=lambda h: hex_luma(h))[0]
+    vivid = [h for h in cols if hex_family(h) not in ("black","white","gray")]
+    top = vivid[0] if vivid else (cols[0] if cols else "#2f2f2f")
+    if top == bottom: bottom = "#c9c9c9"
+    return top, bottom
+
 def guess_material_from_colors(cols:list[str])->str:
     if not cols: return "コットン"
     v = np.mean([hex_luma(x) for x in cols])
@@ -530,15 +552,18 @@ SIL_BOTTOM = ["ストレート","ワイド/フレア","スキニー/テーパー
 # ===== 記録 =====
 with tab1:
     d = st.date_input("日付", value=pd.Timestamp.today(), key="rec_date")
-    up = st.file_uploader("写真（カメラ可）", type=["jpg","jpeg","png","webp"], key="rec_photo")
+
+    # 画像を保持するアップローダ
+    img_bytes = persistent_uploader("写真（カメラ可）", key="rec_photo")
+
     colA, colB = st.columns(2)
     top_sil = colA.selectbox("トップ", SIL_TOP, index=0, key="rec_top_sil")
     bottom_sil = colB.selectbox("ボトム", SIL_BOTTOM, index=0, key="rec_bottom_sil")
     notes = st.text_area("メモ", placeholder="", key="rec_notes")
 
     auto_colors=[]; auto_top="#2f2f2f"; auto_bottom="#c9c9c9"
-    if up is not None:
-        img = Image.open(up).convert("RGB")
+    if img_bytes:
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         st.image(img, use_container_width=True)
         auto_colors = extract_dominant_colors(img, k=5)
         auto_top, auto_bottom = pick_top_bottom_from_colors(auto_colors)
@@ -554,9 +579,9 @@ with tab1:
         top_color = col1.color_picker("トップ色", auto_top, key="rec_top_color")
         bottom_color = col2.color_picker("ボトム色", auto_bottom, key="rec_bottom_color")
 
-    if st.button("保存", type="primary", key="rec_save", disabled=(up is None)):
-        img_bytes = up.read()
-        insert_outfit(str(pd.to_datetime(d).date()), profile.get("season"), top_sil, bottom_sil, top_color, bottom_color, auto_colors, img_bytes, notes)
+    if st.button("保存", type="primary", key="rec_save", disabled=(img_bytes is None)):
+        insert_outfit(str(pd.to_datetime(d).date()), profile.get("season"),
+                      top_sil, bottom_sil, top_color, bottom_color, auto_colors, img_bytes, notes)
         st.success("保存しました")
 
 # ===== カレンダー =====
@@ -610,13 +635,16 @@ with tabCloset:
     add_mode = st.radio("", ["写真から","URLから"], horizontal=True, key="cl_add_mode")
 
     if add_mode=="写真から":
-        upi = st.file_uploader("画像", type=["jpg","jpeg","png","webp"], key="cl_img")
+        # 画像保持版アップローダ
+        img_bytes = persistent_uploader("画像", key="cl_img")
         color_auto="#2f2f2f"; cat_guess="トップス"; season_guess=None; name_suggest="アイテム"; material_guess="コットン"
-        if upi:
-            img_i = Image.open(upi).convert("RGB")
+
+        if img_bytes:
+            img_i = Image.open(io.BytesIO(img_bytes)).convert("RGB")
             st.image(img_i, use_container_width=True)
             cols_auto = extract_dominant_colors(img_i, k=5)
             if cols_auto: color_auto = cols_auto[0]
+            # 面積で上/下どちらが主役かを判定
             cat_guess = guess_category_from_image(img_i)
             season_guess = guess_season_from_colors(cols_auto)
             cname = JP_COLOR.get(nearest_css_name(color_auto), "カラー")
@@ -628,7 +656,8 @@ with tabCloset:
         colN = st.columns(2)
         name = colN[0].text_input("名前", value=name_suggest, key="cl_name")
         category = colN[1].selectbox("カテゴリ", ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"],
-                                     index=(["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"].index(cat_guess) if cat_guess in ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"] else 0),
+                                     index=(["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"].index(cat_guess)
+                                            if cat_guess in ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"] else 0),
                                      key="cl_category")
         color_hex = st.color_picker("色", color_auto, key="cl_color")
         colS = st.columns(2)
@@ -637,11 +666,11 @@ with tabCloset:
                                         key="cl_season")
         material = colS[1].text_input("素材", value=material_guess, key="cl_material")
         notes_i = st.text_area("メモ（用途/特徴）", key="cl_notes")
-        if st.button("追加", key="cl_add_btn"):
-            img_b = upi.read() if upi else None
+
+        if st.button("追加", key="cl_add_btn", disabled=(img_bytes is None)):
             add_item(name or "Unnamed", category, color_hex,
                      None if season_pref=="指定なし" else season_pref,
-                     material, img_b, notes_i)
+                     material, img_bytes, notes_i)
             st.success("追加しました")
 
     else:
@@ -690,7 +719,7 @@ with tabCloset:
                      material_url, img_bytes, notes_url)
             st.success("追加しました")
 
-    # ---------- 一覧 / 編集（厚みのあるUI） ----------
+    # ---------- 一覧 / 編集 ----------
     st.markdown("---")
     st.subheader("一覧 / 編集")
 
@@ -785,23 +814,19 @@ with tabAI:
         rainy= colctx[3].toggle("雨", value=False, key="ai_rain")
         season = profile.get("season"); body_shape = profile.get("body_shape")
 
-        # シンプル生成：トップを基準に他カテゴリから最適を選択
         def pick_best(items, top_hex, category):
             cand=[it for it in items if it[2]==category]
             if not cand: return None, 1e9
             scored=[]
             for row in cand:
                 iid,nm,cat,hx,sp,mat,imgb,nts=row
-                # 調和の近さ（距離ベース）
                 d = rgb_dist(top_hex, hx)
                 s_h = max(0.0, 1.0 - d/MAXD)
-                # PC適合
                 s_p = max(0.0, 1.0 - (palette_distance(hx, season) if season else MAXD/2)/MAXD)
-                # 気候/目的/体型
                 s_c = climate_bonus(mat, heat, humidity, rainy)
                 s_u = purpose_match(nts, want)
                 s_b = body_shape_bonus(nts, body_shape, cat)
-                score = -(0.6*s_h + 0.3*s_p + 0.07*s_c + 0.02*s_u + 0.01*s_b)  # 小さいほど良い
+                score = -(0.6*s_h + 0.3*s_p + 0.07*s_c + 0.02*s_u + 0.01*s_b)
                 scored.append((score,row))
             scored.sort(key=lambda x:x[0])
             return scored[0][1], scored[0][0]
@@ -811,7 +836,6 @@ with tabAI:
             if not tops:
                 st.warning("トップスが未登録です")
             else:
-                # トップスはPC寄与と気候寄与でベース選定
                 best_top=None; best_s=1e9
                 for row in tops:
                     _,_,cat,hx,sp,mat,imgb,nts=row
@@ -825,12 +849,10 @@ with tabAI:
                 bag   ,_ = pick_best(all_items, top[3], "バッグ")
                 outfit={"top":top,"bottom":bottom,"shoes":shoes,"bag":bag}
 
-                # ---- 採点 & 解説 ----
                 score, goods, bads, suggestions, breakdown = evaluate_outfit(
                     outfit, season, body_shape, want, heat, humidity, rainy
                 )
 
-                # 画像つきで表示（カード）
                 st.markdown("### おすすめコーデ")
                 cols = st.columns(4)
                 labels=[("トップ","top"),("ボトム","bottom"),("靴","shoes"),("バッグ","bag")]
@@ -846,7 +868,6 @@ with tabAI:
                         st.caption(f"{label}：{row[1] if row else '—'} / {row[3] if row else '-'}")
                         st.markdown("</div>", unsafe_allow_html=True)
 
-                # スコアリングUI
                 st.markdown("### AIスコア")
                 deg = int(360 * (score/100))
                 st.markdown(f"<div class='scoreRing' style='--deg:{deg}deg'><span>{int(round(score))}</span></div>", unsafe_allow_html=True)
@@ -859,7 +880,6 @@ with tabAI:
                     unsafe_allow_html=True
                 )
 
-                # Good / Bad
                 c1,c2 = st.columns(2)
                 with c1:
                     st.markdown("#### Good")
@@ -868,11 +888,9 @@ with tabAI:
                     st.markdown("#### Bad / 改善ポイント")
                     for b in bads: st.write("• " + b)
 
-                # 買うべき色
                 st.markdown("#### 買うべき色（トップ基準の提案）")
                 st.markdown("".join([f"<span class='swatch' style='background:{s['hex']}'></span> {s['name']} ({s['hex']})  " for s in suggestions]), unsafe_allow_html=True)
 
-                # 保存（AIスコアを記録）
                 if st.button("このコーデを保存", key="ai_save"):
                     save_coord(outfit['top'][0],
                                outfit['bottom'][0] if outfit['bottom'] else None,
