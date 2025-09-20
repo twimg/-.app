@@ -1,4 +1,4 @@
-# app.py — Outf!ts (full)
+# app.py — Outf!ts (full, with Clear fix & bottom compact toggle)
 import streamlit as st
 import pandas as pd, numpy as np
 from PIL import Image
@@ -83,7 +83,6 @@ def init_db():
           top_id INTEGER, bottom_id INTEGER, shoes_id INTEGER, bag_id INTEGER,
           ctx TEXT, score REAL, rating INTEGER
         )""")
-        # お問い合わせテーブル
         c.execute("""
         CREATE TABLE IF NOT EXISTS feedback(
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,7 +90,6 @@ def init_db():
           kind TEXT, subject TEXT, body TEXT, contact TEXT,
           img BLOB, meta TEXT
         )""")
-        # 既存列追加（存在すれば無視）
         try: c.execute("ALTER TABLE profile ADD COLUMN body_shape TEXT")
         except: pass
         try: c.execute("ALTER TABLE profile ADD COLUMN height_cm REAL")
@@ -99,9 +97,6 @@ def init_db():
         conn.commit()
 
 def json_dumps(x): return json.dumps(x, ensure_ascii=False)
-def json_loads(x):
-    try: return json.loads(x) if x else []
-    except: return []
 
 def insert_outfit(d, season, top_sil, bottom_sil, top_color, bottom_color, colors_list, img_bytes, notes):
     with sqlite3.connect(DB_PATH) as conn:
@@ -222,15 +217,18 @@ def send_github_issue(repo:str, token:str, title:str, body:str):
     except Exception as e:
         return False, str(e)
 
-# ---------- セッション保持アップローダ ----------
+# ---------- セッション保持アップローダ（クリアで画像も消す） ----------
 def persistent_uploader(label: str, key: str, types=("jpg","jpeg","png","webp")):
     up = st.file_uploader(label, type=list(types), key=f"{key}_uploader")
     if up is not None:
         st.session_state[f"{key}_bytes"] = up.read()
+
     cols = st.columns([4,1])
     with cols[1]:
         if st.button("クリア", key=f"{key}_clear", help="選択中の画像をクリア"):
-            st.session_state.pop(f"{key}_bytes", None)
+            st.session_state.pop(f"{key}_bytes", None)      # 画像データを消す
+            st.session_state.pop(f"{key}_uploader", None)   # アップローダ内部状態も消す
+            st.rerun()                                      # 即再描画
     return st.session_state.get(f"{key}_bytes")
 
 # ---------- Color utils ----------
@@ -238,7 +236,7 @@ CSS_COLORS = {
  "Black":"#000000","White":"#ffffff","Gray":"#808080","Silver":"#c0c0c0","DimGray":"#696969",
  "Navy":"#000080","MidnightBlue":"#191970","RoyalBlue":"#4169e1","Blue":"#0000ff","DodgerBlue":"#1e90ff",
  "LightBlue":"#add8e6","Teal":"#008080","Aqua":"#00ffff","Turquoise":"#40e0d0",
- "Green":"#008000","Lime":"#00ff00","Olive":"#808000","ForestGreen":"#228b22","SeaGreen":"#2e8b57",
+ "Green":"#008000","Lime":"#00ff00","Olive":"#808000","ForestGreen":"#228b22","SeaGreen":"#2e8e57",
  "Yellow":"#ffff00","Gold":"#ffd700","Khaki":"#f0e68c","Beige":"#f5f5dc","Tan":"#d2b48c",
  "Orange":"#ffa500","Coral":"#ff7f50","Tomato":"#ff6347","Red":"#ff0000","Maroon":"#800000",
  "Pink":"#ffc0cb","HotPink":"#ff69b4","Magenta":"#ff00ff","Purple":"#800080","Indigo":"#4b0082",
@@ -313,7 +311,7 @@ def _skin_score(arrf):
     mask = ((H<=50) | (H>=330)) & (S>=0.15) & (S<=0.68) & (V>=0.20) & (V<=0.95)
     return float(mask.mean())
 
-# ---- 前景マスク（彩度/暗度×サリエンシー×中心重み） ----
+# ---- 前景マスク（彩度/暗度×サリエンシー×中心重み）と重み付中央値 ----
 def _weighted_quantile(values, weights, q=0.5):
     if len(values) == 0: return 0.0
     sorter = np.argsort(values)
@@ -325,7 +323,7 @@ def _weighted_quantile(values, weights, q=0.5):
 def _foreground_mask(arrf):
     cloth = _clothing_mask(arrf)
     mean = arrf.reshape(-1,3).mean(axis=0)
-    sal = np.sqrt(((arrf-mean)**2).sum(axis=2)); 
+    sal = np.sqrt(((arrf-mean)**2).sum(axis=2))
     if sal.max()>1e-6: sal = sal/sal.max()
     h, w = arrf.shape[:2]
     yy, xx = np.mgrid[0:h, 0:w]
@@ -338,7 +336,7 @@ def _foreground_mask(arrf):
     weights = np.clip(0.6*sal + 0.4*center, 0.0, 1.0)
     return m, weights
 
-# ---- 主色抽出（領域別・精密版 / 黒や白の“中立色スナップ”あり） ----
+# ---- 主色抽出（領域別・精密版 / 黒や白の中立色スナップ） ----
 def main_color_from_region(img: Image.Image, region: str) -> str:
     w, h = img.size
     crop = img.crop((0, 0, w, h//2)) if region == "upper" else img.crop((0, h//2, w, h))
@@ -465,7 +463,7 @@ def fetch_from_page(url:str):
     except:
         return None, None, None
 
-# ---- テキスト/素材/季節 推定（補助） ----
+# ---- テキスト→推定（カテゴリ/素材/季節） ----
 CAT_MAP = {
     "トップス":["tシャツ","tee","シャツ","ブラウス","スウェット","パーカー","ニット","セーター","カーディガン","トップス","pullover","hoodie","sweat","blouse"],
     "ボトムス":["パンツ","デニム","ジーンズ","スラックス","トラウザー","スカート","ショーツ","ハーフパンツ","shorts","trousers","skirt","jeans"],
@@ -620,7 +618,8 @@ def shop_suggestions(category:str, base_hex:str, season:str|None):
 init_db()
 profile = load_profile()
 
-compact = st.toggle("コンパクト表示", value=True, help="情報密度を上げます。")
+# 上部ではセッション値だけ参照（トグル自体は一番下に配置）
+compact = st.session_state.get("compact", True)
 st.markdown("<div class='compact'>" if compact else "<div>", unsafe_allow_html=True)
 
 st.title("Outf!ts")
@@ -696,7 +695,7 @@ with tabCal:
             st.markdown(f"### {day}")
             if st.button("閉じる", key="cal_close"):
                 st.session_state["modal_day"] = None
-                st.experimental_rerun()
+                st.rerun()
             for row in lst:
                 oid, dd, seas, ts, bs, tc, bc, cols_js, img_b, nt = row
                 colm = st.columns([1,2])
@@ -717,7 +716,6 @@ with tabCloset:
     if add_mode=="写真から":
         img_bytes = persistent_uploader("画像", key="cl_img")
         color_auto="#2f2f2f"; cat_guess="トップス"; season_guess=None; name_suggest="アイテム"; material_guess="コットン"
-        seed = len(img_bytes) if img_bytes else 0
 
         if img_bytes:
             img_i = Image.open(io.BytesIO(img_bytes)).convert("RGB")
@@ -725,13 +723,13 @@ with tabCloset:
             cat_guess = classify_top_or_bottom(img_i)
             region = "upper" if cat_guess=="トップス" else "lower"
             color_auto = main_color_from_region(img_i, region)
-            season_guess = None
             material_guess = "コットン" if hex_luma(color_auto)>150 else "ウール/ニット"
             cname = JP_COLOR.get(nearest_css_name(color_auto), "カラー")
             name_suggest = f"{cname} {('Tシャツ' if cat_guess=='トップス' else 'パンツ' if cat_guess=='ボトムス' else cat_guess)}"
             st.caption("自動：カテゴリ/主色（領域別）/素材（簡易）")
             st.markdown(f"<span class='swatch' style='background:{color_auto}'></span> {color_auto}", unsafe_allow_html=True)
 
+        seed = (len(img_bytes) if img_bytes else 0)
         colN = st.columns(2)
         name = colN[0].text_input("名前", value=name_suggest, key=f"cl_name_{seed}")
         category = colN[1].selectbox("カテゴリ", ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"],
@@ -741,8 +739,7 @@ with tabCloset:
         color_hex = st.color_picker("色", color_auto, key=f"cl_color_{seed}")
         colS = st.columns(2)
         season_pref = colS[0].selectbox("得意シーズン", ["指定なし","spring","summer","autumn","winter"],
-                                        index=(["指定なし","spring","summer","autumn","winter"].index(season_guess) if season_guess in ["spring","summer","autumn","winter"] else 0),
-                                        key=f"cl_season_{seed}")
+                                        index=0, key=f"cl_season_{seed}")
         material = colS[1].text_input("素材", value=material_guess, key=f"cl_material_{seed}")
         notes_i = st.text_area("メモ（用途/特徴）", key=f"cl_notes_{seed}")
 
@@ -754,7 +751,8 @@ with tabCloset:
 
     else:
         url = st.text_input("商品URL", placeholder="https://", key="cl_url")
-        if st.button("解析", key="cl_parse"):
+        cols_u = st.columns([1,1,1])
+        if cols_u[0].button("解析", key="cl_parse"):
             title, imgb, desc = fetch_from_page(url)
             if not title and not imgb: st.error("取得できませんでした")
             else:
@@ -762,6 +760,9 @@ with tabCloset:
                 st.session_state["url_img"]=imgb
                 st.session_state["url_desc"]=desc
                 st.success("読み込みました")
+        if cols_u[1].button("クリア", key="url_clear"):
+            for k in ["url_title","url_img","url_desc"]: st.session_state.pop(k, None)
+            st.rerun()
 
         title = st.session_state.get("url_title")
         img_bytes = st.session_state.get("url_img")
@@ -798,7 +799,7 @@ with tabCloset:
                      material_url, img_bytes, notes_url)
             st.success("追加しました")
 
-    # ---------- グループごと一覧 / 編集 / 削除 ----------
+    # ---------- 一覧 ----------
     st.markdown("---")
     st.subheader("クローゼット一覧（カテゴリ別）")
 
@@ -885,7 +886,7 @@ with tabCloset:
                 if b3.button("削除", key=f"delete_{iid}", disabled=not confirm):
                     delete_item(iid)
                     st.success("削除しました")
-                    st.experimental_rerun()
+                    st.rerun()
 
 # ===== AIコーデ =====
 with tabAI:
@@ -1073,5 +1074,12 @@ with tabContact:
                 if imgb:
                     try: st.image(Image.open(io.BytesIO(imgb)), use_container_width=True)
                     except: st.write("画像を表示できませんでした")
+
+# ===== ページ最下部：コンパクト表示トグル =====
+st.divider()
+new_compact = st.toggle("コンパクト表示", value=compact, key="compact_ctrl", help="情報密度を上げます。")
+if new_compact != compact:
+    st.session_state["compact"] = new_compact
+    st.rerun()
 
 st.markdown("</div>", unsafe_allow_html=True)
