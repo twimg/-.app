@@ -1,6 +1,9 @@
-# app.py — Outf!ts (persistent image & area-based category)
-# - 一度選んだ画像をセッションに保持（再実行後も再利用）
-# - 写真にトップ/ボトムが両方写る場合、"写っている面積が多い方" を自動採用
+# app.py — Outf!ts (delete + dynamic category + online suggestions)
+# - アイテム削除（安全に参照解除）
+# - 画像/URL追加フォームのカテゴリ等が「毎回リセット」されるよう改良（都度変更可）
+# - AIコーデで不足カテゴリがある場合、主要サイトの検索リンクを色/カテゴリに合わせて提案
+# - 一度選んだ画像はセッションに保持（再実行後も再アップロード不要）
+# - 面積（上半分/下半分）でトップ/ボトム自動判定
 # - 画像つきAIおすすめ + 100点満点AIスコア + Good/Bad + 買うべき色
 # - URL取込は正規表現＋JSON-LD（bs4不要/文字化け補正）
 # - クローゼットはカードギャラリー＋検索/並び替え＋使用回数/最終着用
@@ -9,7 +12,7 @@ import streamlit as st
 import pandas as pd, numpy as np
 from PIL import Image
 import sqlite3, os, io, requests, colorsys, calendar, json, re, html as ihtml
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote_plus
 from datetime import datetime
 from collections import defaultdict
 from math import sqrt
@@ -159,6 +162,15 @@ def update_item(iid:int, name, category, color_hex, season_pref, material, img_b
         c = conn.cursor()
         c.execute("""UPDATE items SET name=?,category=?,color_hex=?,season_pref=?,material=?,img=?,notes=? WHERE id=?""",
                   (name,category,color_hex,season_pref,material,new_img,notes,iid))
+        conn.commit()
+
+def delete_item(iid:int):
+    """アイテム削除 + 参照しているcoordsの外部キー相当をNULLに"""
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM items WHERE id=?", (iid,))
+        for col in ["top_id","bottom_id","shoes_id","bag_id"]:
+            c.execute(f"UPDATE coords SET {col}=NULL WHERE {col}=?", (iid,))
         conn.commit()
 
 def save_coord(top_id, bottom_id, shoes_id, bag_id, ctx:dict, ai_score:float):
@@ -539,6 +551,35 @@ def guess_material_from_colors(cols:list[str])->str:
     if v>200: return "コットン/リネン"
     return "コットン"
 
+# ---------- オンライン提案（不足カテゴリの検索リンク生成） ----------
+SHOP_LINKS = {
+    "ZOZOTOWN": "https://www.google.com/search?q=",
+    "UNIQLO": "https://www.uniqlo.com/jp/ja/search?q=",
+    "GU": "https://www.gu-global.com/jp/ja/search/?q=",
+    "MUJI": "https://www.muji.com/jp/ja/search/?query=",
+    "Rakuten": "https://search.rakuten.co.jp/search/mall/",
+    "Amazon": "https://www.amazon.co.jp/s?k=",
+    "WEAR": "https://wear.jp/item/?keyword=",
+}
+CAT_JP = {"トップス":"トップス","ボトムス":"パンツ","シューズ":"スニーカー","バッグ":"バッグ"}
+def shop_suggestions(category:str, base_hex:str, season:str|None):
+    """各ショップの検索URLを色名・カテゴリ・季節から組み立てて返す（画像は任意）"""
+    color_jp = JP_COLOR.get(nearest_css_name(base_hex), "ベーシック")
+    season_jp = {"spring":"春","summer":"夏","autumn":"秋","winter":"冬"}.get(season or "", "")
+    kw = f"{color_jp} {CAT_JP.get(category, category)} {season_jp}".strip()
+    out=[]
+    for site, base in SHOP_LINKS.items():
+        if site=="ZOZOTOWN":
+            # ZOZOはsite検索の方が安定
+            q = quote_plus(f"site:zozo.jp {kw}")
+            url = base + q
+        elif site=="Rakuten":
+            url = base + quote_plus(kw) + "/"
+        else:
+            url = base + quote_plus(kw)
+        out.append({"site":site, "kw":kw, "url":url})
+    return out
+
 # ---------- UI ----------
 init_db()
 profile = load_profile()
@@ -639,13 +680,15 @@ with tabCloset:
         img_bytes = persistent_uploader("画像", key="cl_img")
         color_auto="#2f2f2f"; cat_guess="トップス"; season_guess=None; name_suggest="アイテム"; material_guess="コットン"
 
+        # 画像が変わったら key シードを更新し、選択UIがリセットされるようにする
+        seed = len(img_bytes) if img_bytes else 0
+
         if img_bytes:
             img_i = Image.open(io.BytesIO(img_bytes)).convert("RGB")
             st.image(img_i, use_container_width=True)
             cols_auto = extract_dominant_colors(img_i, k=5)
             if cols_auto: color_auto = cols_auto[0]
-            # 面積で上/下どちらが主役かを判定
-            cat_guess = guess_category_from_image(img_i)
+            cat_guess = guess_category_from_image(img_i)  # 面積多い方を採用
             season_guess = guess_season_from_colors(cols_auto)
             cname = JP_COLOR.get(nearest_css_name(color_auto), "カラー")
             name_suggest = f"{cname} {('Tシャツ' if cat_guess=='トップス' else 'パンツ' if cat_guess=='ボトムス' else cat_guess)}"
@@ -654,20 +697,20 @@ with tabCloset:
             st.markdown(" ".join([f"<span class='swatch' style='background:{h}'></span>" for h in cols_auto]), unsafe_allow_html=True)
 
         colN = st.columns(2)
-        name = colN[0].text_input("名前", value=name_suggest, key="cl_name")
+        name = colN[0].text_input("名前", value=name_suggest, key=f"cl_name_{seed}")
         category = colN[1].selectbox("カテゴリ", ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"],
                                      index=(["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"].index(cat_guess)
                                             if cat_guess in ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"] else 0),
-                                     key="cl_category")
-        color_hex = st.color_picker("色", color_auto, key="cl_color")
+                                     key=f"cl_category_{seed}")
+        color_hex = st.color_picker("色", color_auto, key=f"cl_color_{seed}")
         colS = st.columns(2)
         season_pref = colS[0].selectbox("得意シーズン", ["指定なし","spring","summer","autumn","winter"],
                                         index=(["指定なし","spring","summer","autumn","winter"].index(season_guess) if season_guess in ["spring","summer","autumn","winter"] else 0),
-                                        key="cl_season")
-        material = colS[1].text_input("素材", value=material_guess, key="cl_material")
-        notes_i = st.text_area("メモ（用途/特徴）", key="cl_notes")
+                                        key=f"cl_season_{seed}")
+        material = colS[1].text_input("素材", value=material_guess, key=f"cl_material_{seed}")
+        notes_i = st.text_area("メモ（用途/特徴）", key=f"cl_notes_{seed}")
 
-        if st.button("追加", key="cl_add_btn", disabled=(img_bytes is None)):
+        if st.button("追加", key=f"cl_add_btn_{seed}", disabled=(img_bytes is None)):
             add_item(name or "Unnamed", category, color_hex,
                      None if season_pref=="指定なし" else season_pref,
                      material, img_bytes, notes_i)
@@ -676,17 +719,19 @@ with tabCloset:
     else:
         url = st.text_input("商品URL", placeholder="https://", key="cl_url")
         if st.button("解析", key="cl_parse"):
-            title, img_bytes, desc = fetch_from_page(url)
-            if not title and not img_bytes: st.error("取得できませんでした")
+            title, imgb, desc = fetch_from_page(url)
+            if not title and not imgb: st.error("取得できませんでした")
             else:
                 st.session_state["url_title"]=title
-                st.session_state["url_img"]=img_bytes
+                st.session_state["url_img"]=imgb
                 st.session_state["url_desc"]=desc
                 st.success("読み込みました")
 
         title = st.session_state.get("url_title")
         img_bytes = st.session_state.get("url_img")
         desc = st.session_state.get("url_desc","")
+
+        seed = (len(img_bytes) if img_bytes else 0) + (len(title or "") if title else 0)
 
         cat_from_text = guess_category_from_text((title or "") + " " + (desc or ""))
         mat_from_text = guess_material_from_text((title or "") + " " + (desc or "")) or ""
@@ -701,25 +746,25 @@ with tabCloset:
             st.markdown(" ".join([f"<span class='swatch' style='background:{h}'></span>" for h in cols_auto]), unsafe_allow_html=True)
 
         colU = st.columns(2)
-        name_url = colU[0].text_input("名前", value=(title or ""), key="cl_name_url")
+        name_url = colU[0].text_input("名前", value=(title or ""), key=f"cl_name_url_{seed}")
         category_url = colU[1].selectbox("カテゴリ", ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"],
                                          index=(["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"].index(cat_from_text) if cat_from_text in ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"] else 0),
-                                         key="cl_category_url")
-        color_url = st.color_picker("色", color_guess, key="cl_color_url")
+                                         key=f"cl_category_url_{seed}")
+        color_url = st.color_picker("色", color_guess, key=f"cl_color_url_{seed}")
 
         colU2 = st.columns(2)
-        material_url = colU2[0].text_input("素材", value=mat_from_text, key="cl_material_url")
+        material_url = colU2[0].text_input("素材", value=mat_from_text, key=f"cl_material_url_{seed}")
         season_idx = (["指定なし","spring","summer","autumn","winter"].index(ssn_from_text) if ssn_from_text in ["spring","summer","autumn","winter"] else 0)
-        season_url = colU2[1].selectbox("得意シーズン", ["指定なし","spring","summer","autumn","winter"], index=season_idx, key="cl_season_url")
+        season_url = colU2[1].selectbox("得意シーズン", ["指定なし","spring","summer","autumn","winter"], index=season_idx, key=f"cl_season_url_{seed}")
 
-        notes_url = st.text_area("メモ", value=(url or desc or ""), key="cl_notes_url")
-        if st.button("追加", key="cl_add_btn_url", disabled=(not name_url and img_bytes is None)):
+        notes_url = st.text_area("メモ", value=(url or desc or ""), key=f"cl_notes_url_{seed}")
+        if st.button("追加", key=f"cl_add_btn_url_{seed}", disabled=(not name_url and img_bytes is None)):
             add_item(name_url or "Unnamed", category_url, color_url,
                      None if season_url=="指定なし" else season_url,
                      material_url, img_bytes, notes_url)
             st.success("追加しました")
 
-    # ---------- 一覧 / 編集 ----------
+    # ---------- 一覧 / 編集 / 削除 ----------
     st.markdown("---")
     st.subheader("一覧 / 編集")
 
@@ -771,7 +816,7 @@ with tabCloset:
                         st.session_state[f"open_exp_{iid}"] = True
                     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("### 編集")
+    st.markdown("### 編集 / 削除")
     for row in items_raw:
         iid, nm, cat, hx, sp, mat, imgb, nts = row
         expanded = st.session_state.get(f"open_exp_{iid}", False)
@@ -795,11 +840,17 @@ with tabCloset:
                 emat = st.text_input("素材", value=mat or "", key=f"edit_mat_{iid}")
                 enotes = st.text_area("メモ", value=nts or "", key=f"edit_notes_{iid}")
                 eup = st.file_uploader("画像差し替え（任意）", type=["jpg","jpeg","png","webp"], key=f"edit_img_{iid}")
-                if st.button("保存", key=f"edit_save_{iid}"):
+                b1, b2, b3 = st.columns([1,1,1])
+                if b1.button("保存", key=f"edit_save_{iid}"):
                     new_img_bytes = eup.read() if eup else None
                     update_item(iid, ename, ecat, ehx, None if esp=="指定なし" else esp, emat, new_img_bytes, enotes)
                     st.session_state[f"open_exp_{iid}"] = True
                     st.success("保存しました")
+                confirm = b2.checkbox("本当に削除", key=f"confirm_del_{iid}")
+                if b3.button("削除", key=f"delete_{iid}", disabled=not confirm):
+                    delete_item(iid)
+                    st.success("削除しました")
+                    st.experimental_rerun()
 
 # ===== AIコーデ =====
 with tabAI:
@@ -891,13 +942,33 @@ with tabAI:
                 st.markdown("#### 買うべき色（トップ基準の提案）")
                 st.markdown("".join([f"<span class='swatch' style='background:{s['hex']}'></span> {s['name']} ({s['hex']})  " for s in suggestions]), unsafe_allow_html=True)
 
+                # 不足カテゴリのオンライン提案
+                missing=[]
+                if outfit["bottom"] is None: missing.append("ボトムス")
+                if outfit["shoes"]  is None: missing.append("シューズ")
+                if outfit["bag"]    is None: missing.append("バッグ")
+                if missing:
+                    st.markdown("### 不足アイテムのオンライン提案")
+                    base_hex = outfit["top"][3] if outfit["top"] else "#2f2f2f"
+                    for cat in missing:
+                        st.markdown(f"**{cat}**（検索キーワード例：{JP_COLOR.get(nearest_css_name(base_hex),'カラー')} + {CAT_JP.get(cat,cat)}）")
+                        links = shop_suggestions(cat, base_hex, season)
+                        cols = st.columns(3)
+                        for col, rec in zip(cols, links[:3]):  # サイト3件ピックアップ
+                            with col:
+                                st.markdown("<div class='card'>", unsafe_allow_html=True)
+                                st.caption(rec["site"])
+                                st.link_button("検索を開く", rec["url"])
+                                st.markdown("</div>", unsafe_allow_html=True)
+
                 if st.button("このコーデを保存", key="ai_save"):
                     save_coord(outfit['top'][0],
                                outfit['bottom'][0] if outfit['bottom'] else None,
                                outfit['shoes'][0] if outfit['shoes'] else None,
                                outfit['bag'][0] if outfit['bag'] else None,
                                {"want":want,"heat":heat,"humidity":humidity,"rainy":rainy,"season":season,"body_shape":body_shape,
-                                "ai_breakdown":breakdown,"goods":goods,"bads":bads,"suggest_colors":[s['hex'] for s in suggestions]},
+                                "ai_breakdown":breakdown,"goods":goods,"bads":bads,"suggest_colors":[s['hex'] for s in suggestions],
+                                "missing":missing},
                                score)
                     st.success("保存しました（AIスコア付き）")
 
