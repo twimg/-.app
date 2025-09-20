@@ -1,5 +1,4 @@
-# app.py — Outf!ts (fix NameError + finer classification/color + grouped list)
-
+# app.py — Outf!ts (full)
 import streamlit as st
 import pandas as pd, numpy as np
 from PIL import Image
@@ -84,6 +83,15 @@ def init_db():
           top_id INTEGER, bottom_id INTEGER, shoes_id INTEGER, bag_id INTEGER,
           ctx TEXT, score REAL, rating INTEGER
         )""")
+        # お問い合わせテーブル
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS feedback(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          created_at TEXT,
+          kind TEXT, subject TEXT, body TEXT, contact TEXT,
+          img BLOB, meta TEXT
+        )""")
+        # 既存列追加（存在すれば無視）
         try: c.execute("ALTER TABLE profile ADD COLUMN body_shape TEXT")
         except: pass
         try: c.execute("ALTER TABLE profile ADD COLUMN height_cm REAL")
@@ -187,6 +195,33 @@ def get_usage_stats():
             if (iid not in last_used) or (created_at > last_used[iid]): last_used[iid] = created_at
     return use_count, last_used
 
+# ----- お問い合わせ -----
+def save_feedback(kind, subject, body, contact, img_bytes, meta:dict):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("""INSERT INTO feedback(created_at,kind,subject,body,contact,img,meta)
+                     VALUES(?,?,?,?,?,?,?)""",
+                  (datetime.utcnow().isoformat(), kind, subject, body, contact, img_bytes,
+                   json.dumps(meta, ensure_ascii=False)))
+        conn.commit()
+
+def list_feedback(limit=30):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        return c.execute("""SELECT id,created_at,kind,subject,body,contact,img,meta
+                            FROM feedback ORDER BY id DESC LIMIT ?""", (int(limit),)).fetchall()
+
+def send_github_issue(repo:str, token:str, title:str, body:str):
+    try:
+        headers={"Authorization": f"token {token}", "Accept":"application/vnd.github+json"}
+        url=f"https://api.github.com/repos/{repo}/issues"
+        r=requests.post(url, headers=headers, json={"title": title, "body": body}, timeout=10)
+        if r.status_code==201:
+            return True, r.json().get("html_url")
+        return False, f"HTTP {r.status_code}"
+    except Exception as e:
+        return False, str(e)
+
 # ---------- セッション保持アップローダ ----------
 def persistent_uploader(label: str, key: str, types=("jpg","jpeg","png","webp")):
     up = st.file_uploader(label, type=list(types), key=f"{key}_uploader")
@@ -223,7 +258,7 @@ def rgb_to_hex(rgb): return "#{:02x}{:02x}{:02x}".format(*rgb)
 def hex_luma(h): r,g,b=hex_to_rgb(h); return 0.2126*r+0.7152*g+0.0722*b
 
 def nearest_css_name(hexstr):
-    r,g,b = hex_to_rgb(hexstr); best,bd=None,10**9
+    r,g,b = hex_to_rgb(hexstr); best=None; bd=10**9
     for name,hx in CSS_COLORS.items():
         rr,gg,bb = hex_to_rgb(hx); d=(r-rr)**2+(g-gg)**2+(b-bb)**2
         if d<bd: bd, best=d, name
@@ -246,7 +281,6 @@ def hex_family(hx):
     return "red"
 
 def adjust_harmony(hx, mode="complement", delta=30):
-    """★ NameError の原因：この関数を入れ忘れていました。"""
     r,g,b=[v/255 for v in hex_to_rgb(hx)]
     h,s,v=colorsys.rgb_to_hsv(r,g,b)
     def wrap(deg): return ((h*360+deg)%360)/360
@@ -256,41 +290,7 @@ def adjust_harmony(hx, mode="complement", delta=30):
         rr,gg,bb=colorsys.hsv_to_rgb(hh,s,v); outs.append(rgb_to_hex((int(rr*255),int(gg*255),int(bb*255))))
     return outs
 
-# ---------- sRGB→Lab & K-Means（色抽出を高精度化） ----------
-def _srgb_to_xyz(arr):
-    a = np.where(arr <= 0.04045, arr/12.92, ((arr+0.055)/1.055)**2.4)
-    M = np.array([[0.4124564,0.3575761,0.1804375],
-                  [0.2126729,0.7151522,0.0721750],
-                  [0.0193339,0.1191920,0.9503041]])
-    return np.tensordot(a, M.T, axes=1)
-def _xyz_to_lab(xyz):
-    Xn,Yn,Zn = 0.95047, 1.00000, 1.08883
-    x = xyz[...,0]/Xn; y = xyz[...,1]/Yn; z = xyz[...,2]/Zn
-    def f(t): return np.where(t>0.008856, np.cbrt(t), 7.787*t+16/116)
-    fx,fy,fz = f(x),f(y),f(z)
-    L = 116*fy - 16; a = 500*(fx - fy); b = 200*(fy - fz)
-    return np.stack([L,a,b], axis=-1)
-def rgb_to_lab_u8(pix):
-    arr = pix.astype(np.float32)/255.0
-    return _xyz_to_lab(_srgb_to_xyz(arr))
-def kmeans_lab(pixels_lab, k=4, iters=12, seed=42):
-    rng = np.random.default_rng(seed)
-    cent = np.empty((k,3), dtype=np.float32)
-    idx = rng.integers(0, len(pixels_lab)); cent[0] = pixels_lab[idx]
-    d2 = np.full(len(pixels_lab), np.inf, dtype=np.float32)
-    for i in range(1,k):
-        d2 = np.minimum(d2, np.sum((pixels_lab - cent[i-1])**2, axis=1))
-        probs = d2 / np.sum(d2)
-        cent[i] = pixels_lab[rng.choice(len(pixels_lab), p=probs)]
-    for _ in range(iters):
-        dist = np.sum((pixels_lab[:,None,:]-cent[None,:,:])**2, axis=2)
-        lab = np.argmin(dist, axis=1)
-        for j in range(k):
-            mask = (lab==j)
-            if np.any(mask):
-                cent[j] = pixels_lab[mask].mean(axis=0)
-    return cent, lab
-
+# ---------- HSVなど補助 ----------
 def _hsv_from_rgb(arrf):
     r,g,b = arrf[...,0],arrf[...,1],arrf[...,2]
     mx = np.max(arrf,axis=2); mn = np.min(arrf,axis=2); diff = mx-mn
@@ -303,97 +303,111 @@ def _hsv_from_rgb(arrf):
     s = np.where(mx==0, 0, diff/mx); v = mx
     return h, s, v
 
-def main_color_from_region(img:Image.Image, region:str)->str:
-    w,h = img.size
-    crop = img.crop((0,0,w,h//2)) if region=="upper" else img.crop((0,h//2,w,h))
-    small = crop.copy(); small.thumbnail((220,220))
-    arr = np.asarray(small).astype(np.uint8)
-    arrf = arr.astype(np.float32)/255.0
-    # 背景除去 + 中心重み
-    hgt,wid = arr.shape[0], arr.shape[1]
-    yy,xx = np.mgrid[0:hgt,0:wid]
-    cx,cy = wid/2, hgt/2
-    sigma = max(hgt,wid)/3.2
-    weights = np.exp(-(((xx-cx)**2 + (yy-cy)**2)/(2*sigma*sigma))).astype(np.float32)
-    cmax = np.max(arrf, axis=2); cmin = np.min(arrf, axis=2)
-    sat  = (cmax - cmin); val = cmax
-    mask = ((sat > 0.10) | (val < 0.85)) & (val < 0.98)
-    pix = arr[mask]; wv = weights[mask]
-    if len(pix) < 50:
-        pix = arr.reshape(-1,3); wv = weights.reshape(-1)
-    lab = rgb_to_lab_u8(pix)
-    k = 4 if len(pix) > 400 else 3
-    cent, labidx = kmeans_lab(lab, k=k, iters=10)
-    # 白/黒ペナルティ + 中心重みでクラス選択
-    def penalty(c):
-        L,a,b = c; pen = 0.0
-        if L>92: pen += 0.7
-        if L<20: pen += 0.4
-        return pen
-    sizes=[]
-    for j in range(k):
-        wsum = float(wv[labidx==j].sum())
-        sizes.append((wsum*(1.0-penalty(cent[j])), j))
-    sizes.sort(reverse=True); best_j = sizes[0][1]
-    sel = pix[labidx==best_j]; wsel = wv[labidx==best_j][:,None]
-    rgb_mean = (sel*wsel).sum(axis=0)/max(1e-6,wsel.sum())
-    return rgb_to_hex(tuple(int(x) for x in rgb_mean))
-
-# ---------- ハイブリッド上/下判定（肌色検知を追加） ----------
-def _edge_histogram(img:Image.Image):
-    a = np.asarray(img.resize((128,128))).astype(np.float32)/255.0
-    gyx = np.abs(np.diff(a, axis=1, prepend=a[:,:1,:])).mean(axis=2)
-    gyy = np.abs(np.diff(a, axis=0, prepend=a[:1,:,:])).mean(axis=2)
-    edge = (gyx+gyy)/2.0
-    return edge.mean(axis=1)
-
 def _clothing_mask(arrf):
     cmax = np.max(arrf, axis=2); cmin = np.min(arrf, axis=2)
     sat  = (cmax - cmin); val = cmax
     return ((sat > 0.12) | (val < 0.75)) & (val < 0.98)
 
 def _skin_score(arrf):
-    # HSVで肌色レンジ（ざっくり）：H 0–50 or 330–360, S 0.15–0.68, V 0.2–0.95
     H,S,V = _hsv_from_rgb(arrf)
     mask = ((H<=50) | (H>=330)) & (S>=0.15) & (S<=0.68) & (V>=0.20) & (V<=0.95)
     return float(mask.mean())
 
-def classify_top_or_bottom(img:Image.Image)->str:
-    w,h = img.size
-    upper = img.crop((0,0,w,h//2)); lower = img.crop((0,h//2,w,h))
-    def area_score(region):
-        arrf = np.asarray(region.resize((160,160))).astype(np.float32)/255.0
-        mask = _clothing_mask(arrf)
-        gyx = np.abs(np.diff(arrf, axis=1, prepend=arrf[:,:1,:])).mean(axis=2)
-        gyy = np.abs(np.diff(arrf, axis=0, prepend=arrf[:1,:,:])).mean(axis=2)
-        edge = (gyx+gyy)/2.0
-        return float(mask.mean() + 0.12*edge[mask].mean() if mask.any() else mask.mean())
-    s_top = area_score(upper); s_bot = area_score(lower)
+# ---- 前景マスク（彩度/暗度×サリエンシー×中心重み） ----
+def _weighted_quantile(values, weights, q=0.5):
+    if len(values) == 0: return 0.0
+    sorter = np.argsort(values)
+    v = values[sorter]; w = weights[sorter]
+    cw = np.cumsum(w); cutoff = q * cw[-1]
+    idx = np.searchsorted(cw, cutoff)
+    return float(v[min(idx, len(v)-1)])
+
+def _foreground_mask(arrf):
+    cloth = _clothing_mask(arrf)
+    mean = arrf.reshape(-1,3).mean(axis=0)
+    sal = np.sqrt(((arrf-mean)**2).sum(axis=2)); 
+    if sal.max()>1e-6: sal = sal/sal.max()
+    h, w = arrf.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w]
+    cx, cy = w/2, h/2
+    sigma = max(h, w) / 3.5
+    center = np.exp(-(((xx-cx)**2 + (yy-cy)**2)/(2*sigma*sigma)))
+    H,S,V = _hsv_from_rgb(arrf)
+    dark_neutral = (S < 0.25) & (V < 0.35)
+    m = (cloth & (sal > 0.15)) | (cloth & (center > 0.30)) | dark_neutral
+    weights = np.clip(0.6*sal + 0.4*center, 0.0, 1.0)
+    return m, weights
+
+# ---- 主色抽出（領域別・精密版 / 黒や白の“中立色スナップ”あり） ----
+def main_color_from_region(img: Image.Image, region: str) -> str:
+    w, h = img.size
+    crop = img.crop((0, 0, w, h//2)) if region == "upper" else img.crop((0, h//2, w, h))
+    small = crop.copy(); small.thumbnail((256, 256))
+    arr = np.asarray(small).astype(np.float32) / 255.0
+
+    mask, wts = _foreground_mask(arr)
+    if mask.sum() < 50:
+        arr = np.asarray(small).astype(np.float32) / 255.0
+        mask = np.ones(arr.shape[:2], bool)
+        wts = np.ones(arr.shape[:2], np.float32)
+
+    sel = arr[mask]; wsel = wts[mask]
+    if len(sel) == 0:
+        sel = arr.reshape(-1,3); wsel = np.ones(len(sel), np.float32)
+
+    R = _weighted_quantile(sel[:,0], wsel, 0.5)
+    G = _weighted_quantile(sel[:,1], wsel, 0.5)
+    B = _weighted_quantile(sel[:,2], wsel, 0.5)
+    r,g,b = float(R), float(G), float(B)
+
+    h_, s_, v_ = colorsys.rgb_to_hsv(r, g, b)
+    if s_ < 0.10:
+        if v_ < 0.18: r=g=b=0.07
+        elif v_ < 0.35: r=g=b=0.16
+        elif v_ > 0.92: r=g=b=0.97
+        else: r=g=b=v_
+
+    return rgb_to_hex((int(r*255), int(g*255), int(b*255)))
+
+# --- 上/下判定（重心×面積×靴エッジ×デニム×肌色帯） ---
+def classify_top_or_bottom(img: Image.Image) -> str:
+    arr = np.asarray(img.resize((224, 224))).astype(np.float32)/255.0
+    H,S,V = _hsv_from_rgb(arr)
+    mask, salw = _foreground_mask(arr)
+
+    row_w = (mask*salw).mean(axis=1)
+    if row_w.sum() == 0: return "トップス"
+    centroid = float(np.average(np.arange(row_w.size), weights=row_w) / row_w.size)
     vote_top = 0; vote_bot = 0
-    if s_bot >= s_top*1.20: vote_bot += 1
-    elif s_top >= s_bot*1.05: vote_top += 1
-    eh = _edge_histogram(img); peak_row = np.argmax(eh)/len(eh)
-    if 0.18 <= peak_row <= 0.42: vote_top += 1
-    if 0.55 <= peak_row <= 0.90: vote_bot += 1
-    def light_sat(region):
-        arrf = np.asarray(region.resize((160,160))).astype(np.float32)/255.0
-        cmax = np.max(arrf, axis=2); cmin = np.min(arrf, axis=2)
-        sat  = (cmax - cmin); val = cmax
-        return float(val.mean()), float(sat.mean())
-    vt,stt = light_sat(upper); vb,stb = light_sat(lower)
-    if vt > vb+0.03 and stt >= stb-0.01: vote_top += 1
-    # デニム/ダーク検知（下に多いとボトム票）
-    def denim_like(region):
-        arrf = np.asarray(region.resize((120,120))).astype(np.float32)/255.0
-        H,S,V = _hsv_from_rgb(arrf)
-        mask = (H>=200)&(H<=255)&(V<0.55)
-        return float(mask.mean())
-    if denim_like(lower) > 0.06: vote_bot += 1
-    # 肌色が上部30%に見えるとトップ票
-    up_small = np.asarray(img.resize((160,160))).astype(np.float32)/255.0
-    up_band = up_small[:48,:,:]
-    if _skin_score(up_band) > 0.04: vote_top += 1
-    return "ボトムス" if vote_bot > vote_top else "トップス"
+    if centroid > 0.56: vote_bot += 2
+    elif centroid < 0.46: vote_top += 2
+
+    mid = arr.shape[0]//2
+    up_m, lo_m = mask[:mid,:].mean(), mask[mid:,:].mean()
+    if lo_m >= up_m*1.10: vote_bot += 1
+    elif up_m >= lo_m*1.05: vote_top += 1
+
+    edge = np.abs(np.diff(arr, axis=1, prepend=arr[:,:1,:])).mean(axis=2)
+    edge_row = edge.mean(axis=1)
+    peak = np.argmax(edge_row)/edge_row.size
+    if 0.55 <= peak <= 0.95: vote_bot += 1
+    if 0.15 <= peak <= 0.45: vote_top += 1
+
+    bh = int(0.18*edge.shape[0])
+    bottom = arr[-bh:,:,:]
+    ebot = edge[-bh:,:]
+    contrast = (np.max(bottom, axis=2) - np.min(bottom, axis=2))
+    shoe_score = float(((contrast > 0.35) & (ebot > 0.10)).mean())
+    if shoe_score > 0.07: vote_bot += 2
+
+    lowerH, lowerS, lowerV = H[mid:,:], S[mid:,:], V[mid:,:]
+    denim_like = (((lowerH >= 195) & (lowerH <= 260)) | (lowerS < 0.20)) & (lowerV < 0.55)
+    if float(denim_like.mean()) > 0.08: vote_bot += 1
+
+    up_band = arr[:int(0.28*arr.shape[0]),:,:]
+    if _skin_score(up_band) > 0.03: vote_top += 1
+
+    return "ボトムス" if vote_bot >= vote_top else "トップス"
 
 # ---------- URL取込 ----------
 UA = {"User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1","Accept-Language":"ja,en;q=0.8"}
@@ -478,7 +492,7 @@ def guess_season_from_text(text:str)->str|None:
     if any(k in t for k in ["秋冬","fw","winter","秋/冬"]): return "winter"
     return None
 
-# ---------- 評価（既存） ----------
+# ---------- 評価 ----------
 SEASON_PALETTES = {
     "spring": ["#ffb3a7","#ffd28c","#ffe680","#b7e07a","#8ed1c8","#ffd7ef","#f5deb3"],
     "summer": ["#c8cbe6","#b0c4de","#c3b1e1","#9fd3c7","#d8d8d8","#e6d5c3","#a3bcd6"],
@@ -610,7 +624,9 @@ compact = st.toggle("コンパクト表示", value=True, help="情報密度を�
 st.markdown("<div class='compact'>" if compact else "<div>", unsafe_allow_html=True)
 
 st.title("Outf!ts")
-tab1, tabCal, tabCloset, tabAI, tabProfile = st.tabs(["📒 記録","📅 カレンダー","🧳 クローゼット","🤖 AIコーデ","👤 プロフィール"])
+tab1, tabCal, tabCloset, tabAI, tabProfile, tabContact = st.tabs(
+    ["📒 記録","📅 カレンダー","🧳 クローゼット","🤖 AIコーデ","👤 プロフィール","📮 お問い合わせ"]
+)
 
 SIL_TOP = ["ジャスト/レギュラー","オーバーサイズ","クロップド/短丈","タイト/フィット"]
 SIL_BOTTOM = ["ストレート","ワイド/フレア","スキニー/テーパード","Aライン/スカート","ショーツ"]
@@ -791,7 +807,6 @@ with tabCloset:
     per_row = int(frow[2].selectbox("列数", [1,2,3], index=2, help="画面密度を変更"))
 
     use_count, last_used = get_usage_stats()
-    def _last_dt(iid): return last_used.get(iid, "")
     all_items = list_items("すべて")
     if q:
         ql = q.lower()
@@ -1007,5 +1022,56 @@ with tabProfile:
                      body_shape=None if body_shape=="未設定" else body_shape,
                      height_cm=float(height))
         st.success("保存しました")
+
+# ===== お問い合わせ =====
+with tabContact:
+    st.subheader("お問い合わせ / フィードバック")
+    st.caption("要望・不具合・質問などを送信できます。画像添付もOK。")
+
+    with st.form("fb_form", clear_on_submit=True):
+        kind = st.selectbox("種別", ["要望","不具合","質問","その他"], index=0)
+        subject = st.text_input("件名", placeholder="例：トップス自動判定の精度を上げたい など")
+        body = st.text_area("内容", height=140)
+        contact = st.text_input("連絡先（任意）", placeholder="メールやSNS, なくてもOK")
+        img = st.file_uploader("スクショ/画像（任意）", type=["jpg","jpeg","png","webp"])
+        use_github = st.checkbox("GitHubにIssueを同時作成（Secrets設定時）", value=False,
+                                 help="App Settings → Secrets に GH_REPO と GH_TOKEN を設定している場合のみ")
+        submitted = st.form_submit_button("送信", type="primary")
+
+    if submitted:
+        img_bytes = img.read() if img else None
+        meta = {
+            "app": "Outf!ts",
+            "profile": {"season": profile.get("season"), "body_shape": profile.get("body_shape")},
+            "ts": datetime.utcnow().isoformat()
+        }
+        save_feedback(kind, subject or "(件名なし)", body or "", contact or "", img_bytes, meta)
+        st.success("受け付けました。アプリ内に保存しました。")
+
+        if use_github and "GH_REPO" in st.secrets and "GH_TOKEN" in st.secrets:
+            ok, info = send_github_issue(
+                st.secrets["GH_REPO"], st.secrets["GH_TOKEN"],
+                f"[Outf!ts] {kind}: {subject or '(件名なし)'}",
+                (body or "") + f"\n\n---\n連絡先: {contact or '未記入'}\nmeta: {json.dumps(meta, ensure_ascii=False)}"
+            )
+            if ok:
+                st.success("GitHub Issue を作成しました")
+                st.link_button("Issueを開く", info)
+            else:
+                st.warning(f"GitHub Issueの作成に失敗: {info}")
+
+    st.markdown("---")
+    st.caption("直近の送信（アプリ内保存）")
+    rows = list_feedback(10)
+    if not rows:
+        st.write("まだありません")
+    else:
+        for fid,created,kind,subject,body,contact,imgb,meta in rows:
+            with st.expander(f"[{created[:19]}] {kind}：{subject}（ID:{fid}）", expanded=False):
+                st.write(body or "")
+                st.caption(f"連絡先: {contact or '—'}")
+                if imgb:
+                    try: st.image(Image.open(io.BytesIO(imgb)), use_container_width=True)
+                    except: st.write("画像を表示できませんでした")
 
 st.markdown("</div>", unsafe_allow_html=True)
