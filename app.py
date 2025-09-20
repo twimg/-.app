@@ -1,13 +1,20 @@
-# app.py — Outfit Log (Mobile Plus, URL取込 & 編集 / DuplicateElementId対策済)
+# app.py — Outfit Log (Mobile+)
+# - use_container_width で警告解消 / 全ウィジェットに unique key 付与（DuplicateElementId対策）
+# - 商品URL取込：UNIQLO/ZOZOTOWN 他（og:image / twitter:image / JSON-LD の image を解析）
+# - クローゼットからのAIコーデ自動生成（天候・PCシーズン・体格を考慮）
+# - 生成コーデの保存＆⭐️評価（5段階）
+# - 体格/パーソナルカラーをプロフィールに保存 → 推薦に反映
+
 import streamlit as st
 import pandas as pd, numpy as np
 from PIL import Image, ImageDraw
-import sqlite3, os, io, requests, colorsys, calendar, json
+import sqlite3, os, io, requests, colorsys, calendar, json, re
 from urllib.parse import urljoin
+from datetime import datetime
 
 st.set_page_config(page_title="Outfit Log — Mobile", layout="centered")
 
-# ---------- PWA-ish（なくてもOK） ----------
+# ---------- PWA-ish（任意） ----------
 st.markdown("""
 <link rel="manifest" href="manifest.webmanifest">
 <script>
@@ -34,7 +41,8 @@ def init_db():
         c.execute("""
         CREATE TABLE IF NOT EXISTS profile(
           id INTEGER PRIMARY KEY CHECK(id=1),
-          season TEXT, undertone TEXT, home_lat REAL, home_lon REAL, city TEXT
+          season TEXT, undertone TEXT, home_lat REAL, home_lon REAL, city TEXT,
+          body_shape TEXT, height_cm REAL
         )""")
         c.execute("""
         CREATE TABLE IF NOT EXISTS items(
@@ -42,6 +50,19 @@ def init_db():
           name TEXT, category TEXT, color_hex TEXT, season_pref TEXT,
           material TEXT, img BLOB, notes TEXT
         )""")
+        # 生成コーデ履歴＋評価
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS coords(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          created_at TEXT,
+          top_id INTEGER, bottom_id INTEGER, shoes_id INTEGER, bag_id INTEGER,
+          ctx TEXT, score REAL, rating INTEGER
+        )""")
+        # 既存DBに後から追加された列は ALTER で安全に拡張
+        try: c.execute("ALTER TABLE profile ADD COLUMN body_shape TEXT");   # 1回目のみ
+        except: pass
+        try: c.execute("ALTER TABLE profile ADD COLUMN height_cm REAL");
+        except: pass
         conn.commit()
 
 def json_dumps(x): return json.dumps(x, ensure_ascii=False)
@@ -66,17 +87,20 @@ def fetch_outfits_on(day_str):
 def load_profile():
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        row = c.execute("SELECT season,undertone,home_lat,home_lon,city FROM profile WHERE id=1").fetchone()
-    return {"season":row[0],"undertone":row[1],"home_lat":row[2],"home_lon":row[3],"city":row[4]} if row else \
-           {"season":None,"undertone":None,"home_lat":None,"home_lon":None,"city":None}
+        row = c.execute("SELECT season,undertone,home_lat,home_lon,city,body_shape,height_cm FROM profile WHERE id=1").fetchone()
+    return {"season":row[0],"undertone":row[1],"home_lat":row[2],"home_lon":row[3],
+            "city":row[4],"body_shape":row[5],"height_cm":row[6]} if row else \
+           {"season":None,"undertone":None,"home_lat":None,"home_lon":None,"city":None,"body_shape":None,"height_cm":None}
 
 def save_profile(**kwargs):
     cur = load_profile()
     cur.update({k:v for k,v in kwargs.items() if v is not None})
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO profile(id,season,undertone,home_lat,home_lon,city) VALUES(1,?,?,?,?,?)",
-                  (cur["season"], cur["undertone"], cur["home_lat"], cur["home_lon"], cur["city"]))
+        c.execute("""INSERT OR REPLACE INTO profile(id,season,undertone,home_lat,home_lon,city,body_shape,height_cm)
+                     VALUES(1,?,?,?,?,?,?,?)""",
+                  (cur["season"], cur["undertone"], cur["home_lat"], cur["home_lon"],
+                   cur["city"], cur["body_shape"], cur["height_cm"]))
         conn.commit()
 
 def add_item(name, category, color_hex, season_pref, material, img_bytes, notes):
@@ -109,6 +133,14 @@ def update_item(iid:int, name, category, color_hex, season_pref, material, img_b
         c = conn.cursor()
         c.execute("""UPDATE items SET name=?,category=?,color_hex=?,season_pref=?,material=?,img=?,notes=? WHERE id=?""",
                   (name,category,color_hex,season_pref,material,new_img,notes,iid))
+        conn.commit()
+
+def save_coord(top_id, bottom_id, shoes_id, bag_id, ctx:dict, score:float, rating:int|None):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("""INSERT INTO coords(created_at,top_id,bottom_id,shoes_id,bag_id,ctx,score,rating)
+                     VALUES(?,?,?,?,?,?,?,?)""",
+                  (datetime.utcnow().isoformat(), top_id, bottom_id, shoes_id, bag_id, json_dumps(ctx), score, rating))
         conn.commit()
 
 # ---------- Color utils ----------
@@ -168,6 +200,21 @@ def extract_dominant_colors(img:Image.Image, k=5):
         if len(out)>=k: break
     return out
 
+SEASON_PALETTES = {
+    "spring": ["#ffb3a7","#ffd28c","#ffe680","#b7e07a","#8ed1c8","#ffd7ef","#f5deb3"],
+    "summer": ["#c8cbe6","#b0c4de","#c3b1e1","#9fd3c7","#d8d8d8","#e6d5c3","#a3bcd6"],
+    "autumn": ["#a0522d","#c68642","#8f9779","#556b2f","#b5651d","#6b4f3f","#8b6c42"],
+    "winter": ["#000000","#ffffff","#4169e1","#8a2be2","#ff1493","#00ced1","#2f4f4f"],
+}
+def palette_distance(hexstr, user_season):
+    if not user_season or user_season not in SEASON_PALETTES: return 0.0
+    px=hex_to_rgb(hexstr); best=1e9
+    for p in SEASON_PALETTES[user_season]:
+        rr,gg,bb=hex_to_rgb(p)
+        d=(px[0]-rr)**2+(px[1]-gg)**2+(px[2]-bb)**2
+        if d<best: best=d
+    return best
+
 # ---------- Weather ----------
 def fetch_open_meteo(lat, lon):
     try:
@@ -191,6 +238,7 @@ def weather_tip(daily):
 
 # ---------- Helpers ----------
 def img_from_bytes(b): return Image.open(io.BytesIO(b)).convert("RGB")
+
 def make_share_card(row, out_path="data/exports/share.png", weather=None):
     os.makedirs("data/exports", exist_ok=True)
     (oid,dd,seas,ts,bs,tc,bc,cols_js,img_b,nt)=row
@@ -222,42 +270,151 @@ def make_share_card(row, out_path="data/exports/share.png", weather=None):
     base.save(out_path,"PNG")
     with open(out_path,"rb") as f: return f.read()
 
-# ---------- URL 取り込み ----------
+# ---------- URL 取り込み（ZOZO強化） ----------
+UA = {"User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+      "Accept-Language":"ja,en;q=0.8"}
+
 def fetch_image_bytes_from_url(url:str):
     try:
-        r=requests.get(url, timeout=10, headers={"User-Agent":"Mozilla/5.0"})
-        if r.status_code==200:
-            return r.content
+        r=requests.get(url, timeout=10, headers=UA)
+        if r.status_code==200: return r.content
     except: return None
     return None
 
+def _meta(content, name):
+    m=re.search(rf'<meta[^>]+(?:property|name)=["\']{re.escape(name)}["\'][^>]+content=["\']([^"\']+)["\']', content, re.I)
+    return m.group(1) if m else None
+
+def _jsonld_image(content):
+    # JSON-LDの"image"（配列 or 文字列）
+    for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', content, re.I|re.S):
+        try:
+            data=json.loads(m.group(1))
+            if isinstance(data, list):
+                for d in data:
+                    img = d.get("image") if isinstance(d, dict) else None
+                    if img: return img[0] if isinstance(img, list) else img
+            elif isinstance(data, dict):
+                img = data.get("image")
+                if img: return img[0] if isinstance(img, list) else img
+        except: pass
+    return None
+
 def fetch_from_page(url:str):
-    """商品ページURLから og:image と title を推定（bs4ナシ簡易版）"""
+    """商品ページURLから title と image を推定（UNIQLO/ZOZO/他）"""
     try:
-        r=requests.get(url, timeout=10, headers={"User-Agent":"Mozilla/5.0"})
+        r=requests.get(url, timeout=10, headers=UA)
         if r.status_code!=200: return None,None
         html=r.text
-        import re
-        m=re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
-        img_url=m.group(1) if m else None
-        if img_url: img_url=urljoin(url, img_url)
-        t=re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
-        title=t.group(1).strip() if t else None
+
+        # 1) og:title / og:image / twitter:image
+        title = _meta(html, "og:title") or _meta(html, "twitter:title")
+        img_url = _meta(html, "og:image:secure_url") or _meta(html, "og:image") or _meta(html, "twitter:image")
+
+        # 2) JSON-LD の image
+        if not img_url:
+            img_url = _jsonld_image(html)
+
+        # 3) Fallback: <title>
         if not title:
             t2=re.search(r'<title[^>]*>(.*?)</title>', html, re.I|re.S)
             title=t2.group(1).strip() if t2 else None
+
+        if img_url:
+            img_url=urljoin(url, img_url)
         img_bytes=fetch_image_bytes_from_url(img_url) if img_url else None
         return title, img_bytes
     except:
         return None, None
 
+# ---------- 推薦/スコアリング ----------
+PURPOSES = ["指定なし","通勤","デート","カジュアル","スポーツ","フォーマル","雨の日"]
+
+def purpose_match(notes:str, want:str)->int:
+    if not want or want=="指定なし": return 0
+    n=notes or ""
+    score=0
+    if want=="通勤":     score += any(k in n for k in ["ジャケット","シャツ","スラックス","革靴","きれいめ"])
+    if want=="デート":   score += any(k in n for k in ["綺麗め","スカート","ワンピ","ヒール","上品"])
+    if want=="スポーツ": score += any(k in n for k in ["スニーカー","ジャージ","ドライ","ラン","トレ"])
+    if want=="フォーマル":score += any(k in n for k in ["ネクタイ","セットアップ","ドレス","革靴"])
+    if want=="雨の日":  score += any(k in n for k in ["撥水","防水","ゴア","レイン","ナイロン"])
+    return score
+
+def body_shape_bonus(notes:str, body:str|None, category:str)->int:
+    if not body: return 0
+    n=(notes or "").lower()
+    b=body
+    # ゆるいヒューリスティック
+    if b=="straight":   # 骨格ストレート
+        if category in ["ボトムス"] and any(k in n for k in ["テーパード","センタープレス","ストレート"]): return 1
+        if category in ["トップス","アウター"] and any(k in n for k in ["vネック","襟付き","構築的","ジャケット"]): return 1
+    if b=="wave":       # 骨格ウェーブ
+        if category in ["ボトムス"] and any(k in n for k in ["ハイウエスト","aライン","フレア"]): return 1
+        if category in ["トップス"] and any(k in n for k in ["短丈","クロップド","柔らかい","リブ"]): return 1
+    if b=="natural":    # 骨格ナチュラル
+        if any(k in n for k in ["ワイド","オーバーサイズ","ドロップショルダー","リネン","ツイード"]): return 1
+    return 0
+
+def weather_bonus(material:str|None, felt:int, rainy:bool)->int:
+    m=(material or "").lower()
+    s=0
+    if felt>=27 and any(k in m for k in ["linen","リネン","cotton","コットン","メッシュ","ドライ"]): s+=1
+    if felt<=12 and any(k in m for k in ["wool","ウール","ダウン","中綿","フリース"]): s+=1
+    if rainy and any(k in m for k in ["ナイロン","nylon","ゴア","gore","防水","撥水"]): s+=1
+    return s
+
+def color_pair_score(top_hex:str, item_hex:str, season:str|None)->float:
+    # 補色/類似/トライアド候補への距離 + シーズンパレット近さ
+    r = adjust_harmony(top_hex,"complement")+adjust_harmony(top_hex,"analogous")+adjust_harmony(top_hex,"triadic")
+    # 最小距離
+    def dist(h1,h2):
+        r1,g1,b1=hex_to_rgb(h1); r2,g2,b2=hex_to_rgb(h2); return (r1-r2)**2+(g1-g2)**2+(b1-b2)**2
+    d = min([dist(item_hex, h) for h in r] + [dist(item_hex, top_hex)])
+    return d + 0.1*palette_distance(item_hex, season)
+
+def pick_best(items, top_hex, season, body_shape, want, felt, rainy, category):
+    cand=[it for it in items if it[2]==category]  # (id,name,cat,color_hex,season_pref,material,img,notes)
+    if not cand: return None, 1e9
+    scored=[]
+    for row in cand:
+        iid,nm,cat,hx,sp,mat,imgb,nts=row
+        s  = color_pair_score(top_hex, hx, season)
+        s -= 200 if sp and season and sp==season else 0
+        s -= 120*purpose_match(nts or "", want)
+        s -= 80*body_shape_bonus(nts or "", body_shape, cat)
+        s -= 60*weather_bonus(mat, felt, rainy)
+        scored.append((s,row))
+    scored.sort(key=lambda x:x[0])
+    return scored[0][1], scored[0][0]
+
+def generate_outfit_from_closet(all_items, season, body_shape, want, felt, rainy):
+    # 1) 主役トップを自動選択（季節×体格×目的で最良）
+    tops=[it for it in all_items if it[2]=="トップス"]
+    if not tops: return None, None
+    t_best=None; t_score=1e9
+    for row in tops:
+        _,_,cat,hx,sp,mat,imgb,nts=row
+        s  = 0.2*palette_distance(hx, season)
+        s -= 100*(sp==season) if sp and season else 0
+        s -= 80*body_shape_bonus(nts or "", body_shape, cat)
+        s -= 40*weather_bonus(mat, felt, rainy)
+        if s<t_score: t_score=s; t_best=row
+    top=t_best
+    # 2) 他アイテム
+    bottom,b_sc = pick_best(all_items, top[3], season, body_shape, want, felt, rainy, "ボトムス")
+    shoes ,s_sc = pick_best(all_items, top[3], season, body_shape, want, felt, rainy, "シューズ")
+    bag   ,g_sc = pick_best(all_items, top[3], season, body_shape, want, felt, rainy, "バッグ")
+    total_score = t_score + b_sc + s_sc + g_sc
+    return {"top":top,"bottom":bottom,"shoes":shoes,"bag":bag}, total_score
+
 # ---------- UI ----------
 init_db()
 profile = load_profile()
 
-st.title("📱 Outfit Log — モバイル（URL取込対応）")
-tab1, tabCal, tabCloset, tabWx, tabAdvice = st.tabs(
-    ["📒 記録","📅 カレンダー","🧳 クローゼット","☀ 天気","🎨 アドバイス"]
+st.title("📱 Outfit Log — モバイル（URL取込・AIコーデ・評価対応）")
+tab1, tabCal, tabCloset, tabAI, tabWx, tabProfile = st.tabs(
+    ["📒 記録","📅 カレンダー","🧳 クローゼット","🤖 AIコーデ","☀ 天気","👤 プロフィール"]
 )
 
 SIL_TOP = ["ジャスト/レギュラー","オーバーサイズ","クロップド/短丈","タイト/フィット"]
@@ -276,7 +433,7 @@ with tab1:
     auto_colors=[]
     if up is not None:
         img = Image.open(up).convert("RGB")
-        st.image(img, caption="プレビュー", use_column_width=True)
+        st.image(img, caption="プレビュー", use_container_width=True)
         auto_colors = extract_dominant_colors(img, k=5)
         st.caption("写真から主要色")
         cols = st.columns(len(auto_colors) or 1)
@@ -314,12 +471,11 @@ with tabCal:
                 if d0.month != int(month): style += "; opacity:0.5"
                 st.markdown(f"<div style='{style}'><b>{d0.day}</b></div>", unsafe_allow_html=True)
                 if slots:
-                    try: st.image(img_from_bytes(slots[0][8]), use_column_width=True)
+                    try: st.image(img_from_bytes(slots[0][8]), use_container_width=True)
                     except: pass
                     if st.button("詳細", key=f"detail_{d0.isoformat()}"):
                         st.session_state["modal_day"] = str(d0)
 
-    # Modal
     if st.session_state["modal_day"]:
         day = st.session_state["modal_day"]
         lst = fetch_outfits_on(day)
@@ -334,7 +490,7 @@ with tabCal:
                 oid, dd, seas, ts, bs, tc, bc, cols_js, img_b, nt = row
                 colm = st.columns([1,2])
                 with colm[0]:
-                    try: st.image(img_from_bytes(img_b), width=120)
+                    try: st.image(img_from_bytes(img_b), use_container_width=True)
                     except: st.write("画像なし")
                 with colm[1]:
                     st.write(f"Season: {seas or '-'} / Top:{ts}({tc}) / Bottom:{bs}({bc})")
@@ -362,43 +518,42 @@ with tabCloset:
         color_hex = st.color_picker("色", "#2f2f2f", key="cl_color")
         colC2 = st.columns(2)
         season_pref = colC2[0].selectbox("得意シーズン", ["指定なし","spring","summer","autumn","winter"], index=0, key="cl_season")
-        material = colC2[1].text_input("素材", placeholder="例：コットン/ウール/リネン", key="cl_material")
+        material = colC2[1].text_input("素材", placeholder="例：コットン/ウール/リネン/ナイロン", key="cl_material")
         upi = st.file_uploader("アイテム画像", type=["jpg","jpeg","png","webp"], key="cl_img")
-        notes_i = st.text_area("メモ", placeholder="ブランド/用途など", key="cl_notes")
+        notes_i = st.text_area("メモ（用途/特徴）", placeholder="例：撥水 スニーカー / センタープレス / Vネック", key="cl_notes")
 
         if st.button("追加する", key="cl_add_btn"):
             img_b = upi.read() if upi else None
             add_item(name or "Unnamed", category, color_hex, None if season_pref=="指定なし" else season_pref, material, img_b, notes_i)
             st.success("追加しました")
 
-    else:  # URLから追加
+    else:  # URLから追加（UNIQLO/ZOZOTOWN等）
         url = st.text_input("商品ページのURL", placeholder="https://...", key="cl_url")
         if st.button("ページを解析", key="cl_parse"):
             title, img_bytes = fetch_from_page(url)
             if not title and not img_bytes:
                 st.error("取得できませんでした。URLをご確認ください。")
             else:
-                st.session_state["url_title"] = title
-                st.session_state["url_img_bytes"] = img_bytes
+                colors = []
+                if img_bytes:
+                    img = img_from_bytes(img_bytes)
+                    st.image(img, caption=title or "画像", use_container_width=True)
+                    colors = extract_dominant_colors(img, k=5)
+                st.session_state["url_title"]=title
+                st.session_state["url_img"]=img_bytes
+                st.session_state["url_colors"]=colors
                 st.success("候補を読み込みました")
 
         title = st.session_state.get("url_title")
-        img_bytes = st.session_state.get("url_img_bytes")
-        if img_bytes:
-            img = img_from_bytes(img_bytes)
-            st.image(img, caption=title or "画像", use_column_width=True)
-            cols_auto = extract_dominant_colors(img, k=5)
-            st.caption("主要色（自動推定）")
-            cs = st.columns(len(cols_auto))
-            for i,cx in enumerate(cols_auto):
-                cs[i].markdown(f"<div style='width:24px;height:24px;background:{cx};border:1px solid #aaa;border-radius:6px'></div>", unsafe_allow_html=True)
+        img_bytes = st.session_state.get("url_img")
+        colors = st.session_state.get("url_colors", [])
         colU = st.columns(2)
         name_url = colU[0].text_input("名前/アイテム名", value=title or "", key="cl_name_url")
         category_url = colU[1].selectbox("カテゴリ", ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"], key="cl_category_url")
-        color_url = st.color_picker("色（推定を調整可）", (cols_auto[0] if img_bytes else "#2f2f2f") if (img_bytes) else "#2f2f2f", key="cl_color_url")
+        color_url = st.color_picker("色（推定を調整可）", colors[0] if colors else "#2f2f2f", key="cl_color_url")
         material_url = st.text_input("素材", placeholder="例：コットン/ナイロン", key="cl_material_url")
         notes_url = st.text_area("メモ", value=(url or ""), key="cl_notes_url")
-        if st.button("この内容で追加", key="cl_add_btn_url", disabled=(img_bytes is None and (not name_url))):
+        if st.button("この内容で追加", key="cl_add_btn_url", disabled=(not name_url and img_bytes is None)):
             add_item(name_url or "Unnamed", category_url, color_url, None, material_url, img_bytes, notes_url)
             st.success("追加しました（URLから）")
 
@@ -407,19 +562,18 @@ with tabCloset:
     filt = st.selectbox("カテゴリで絞り込み", ["すべて","トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"], index=0, key="cl_filter")
     items = list_items(filt)
     st.caption(f"{len(items)}件")
-
     for iid, nm, cat, hx, sp, mat, imgb, nts in items:
         with st.expander(f"{nm}（{cat}）", expanded=False):
             colv = st.columns([1,2])
             with colv[0]:
                 if imgb: 
-                    try: st.image(img_from_bytes(imgb), width=140)
+                    try: st.image(img_from_bytes(imgb), use_container_width=True)
                     except: st.write("画像なし")
                 else: st.write("画像なし")
             with colv[1]:
                 ename = st.text_input("名前", value=nm, key=f"edit_name_{iid}")
                 ecat = st.selectbox("カテゴリ", ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"],
-                                    index=["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"].index(cat) if cat in ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"] else 0,
+                                    index=(["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"].index(cat) if cat in ["トップス","ボトムス","アウター","ワンピース","シューズ","バッグ","アクセ"] else 0),
                                     key=f"edit_cat_{iid}")
                 ehx = st.color_picker("色", hx or "#2f2f2f", key=f"edit_color_{iid}")
                 esp = st.selectbox("得意シーズン", ["指定なし","spring","summer","autumn","winter"],
@@ -429,9 +583,50 @@ with tabCloset:
                 enotes = st.text_area("メモ", value=nts or "", key=f"edit_notes_{iid}")
                 eup = st.file_uploader("画像を差し替え（任意）", type=["jpg","jpeg","png","webp"], key=f"edit_img_{iid}")
                 if st.button("保存", key=f"edit_save_{iid}"):
-                    new_img_bytes = eup.read() if eup else None  # Noneなら現画像維持
+                    new_img_bytes = eup.read() if eup else None
                     update_item(iid, ename, ecat, ehx, None if esp=="指定なし" else esp, emat, new_img_bytes, enotes)
                     st.success("保存しました（再読込で反映）")
+
+# ===== AIコーデ =====
+with tabAI:
+    st.subheader("🤖 登録アイテムからAIコーデを提案（評価つき）")
+    all_items = list_items("すべて")
+    if not all_items:
+        st.info("まずはクローゼットにアイテムを登録してください。")
+    else:
+        colctx = st.columns(3)
+        want = colctx[0].selectbox("用途", PURPOSES, index=0, key="ai_want")
+        felt = colctx[1].slider("体感温度（℃）", 0, 40, 22, key="ai_felt")
+        rainy= colctx[2].toggle("今日は雨", value=False, key="ai_rain")
+        season = profile.get("season")
+        body_shape = profile.get("body_shape")
+
+        if st.button("コーデを生成", key="ai_gen"):
+            outfit, score = generate_outfit_from_closet(all_items, season, body_shape, want, int(felt), bool(rainy))
+            if not outfit:
+                st.warning("候補が見つかりませんでした（トップス/ボトムス/靴/バッグを登録してください）。")
+            else:
+                st.markdown("### 提案セット")
+                cols = st.columns(4)
+                labels=[("トップ","top"),("ボトム","bottom"),("靴","shoes"),("バッグ","bag")]
+                for j,(label,key) in enumerate(labels):
+                    with cols[j]:
+                        row = outfit[key]
+                        if row:
+                            if row[6]: st.image(img_from_bytes(row[6]), use_container_width=True)
+                            st.caption(f"{label}：{row[1]} / {row[3]}")
+                        else:
+                            st.caption(f"{label}：候補なし")
+
+                st.caption(f"内部スコア（小さいほど適合）：{score:.1f}")
+                rating = st.select_slider("このコーデの評価", options=[1,2,3,4,5], value=4, key="ai_rating")
+                if st.button("保存（履歴に残す）", key="ai_save"):
+                    save_coord(outfit["top"][0], outfit["bottom"][0] if outfit["bottom"] else None,
+                               outfit["shoes"][0] if outfit["shoes"] else None,
+                               outfit["bag"][0] if outfit["bag"] else None,
+                               {"want":want,"felt":felt,"rainy":rainy,"season":season,"body_shape":body_shape},
+                               float(score), int(rating))
+                    st.success("保存しました！✨ ありがとう、評価は次回の学習に使われます。")
 
 # ===== 天気 =====
 with tabWx:
@@ -477,45 +672,23 @@ with tabWx:
     else:
         st.warning("天気が取得できませんでした。")
 
-# ===== アドバイス =====
-with tabAdvice:
-    st.subheader("色 & 形のアドバイス")
-    colx = st.columns(2)
-    top_color2 = colx[0].color_picker("トップ色", "#2f2f2f", key="adv_top_color")
-    bottom_color2 = colx[1].color_picker("ボトム色", "#c9c9c9", key="adv_bottom_color")
-    ts2 = st.selectbox("トップのシルエット", SIL_TOP, index=0, key="adv_ts")
-    bs2 = st.selectbox("ボトムのシルエット", SIL_BOTTOM, index=0, key="adv_bs")
+# ===== プロフィール =====
+with tabProfile:
+    st.subheader("👤 体格・パーソナルカラー設定")
+    colp = st.columns(2)
+    season = colp[0].selectbox("PCシーズン", ["未設定","spring","summer","autumn","winter"],
+                               index=(["未設定","spring","summer","autumn","winter"].index(profile.get("season")) if profile.get("season") else 0),
+                               key="prof_season")
+    body_shape = colp[1].selectbox("体格タイプ", ["未設定","straight","wave","natural"],
+                                   index=(["未設定","straight","wave","natural"].index(profile.get("body_shape")) if profile.get("body_shape") else 0),
+                                   key="prof_body")
+    height = st.number_input("身長（cm / 任意）", min_value=120.0, max_value=220.0, step=0.5,
+                             value=float(profile.get("height_cm") or 165.0), key="prof_height")
 
-    def color_advice(top_hex: str, bottom_hex: str, season: str|None):
-        tips=[]
-        fam_top, fam_bottom = hex_family(top_hex), hex_family(bottom_hex)
-        if fam_top not in ("black","gray","white","blue","beige") and fam_bottom not in ("black","gray","white","blue","beige"):
-            tips.append("上下どちらかはニュートラル（黒/白/グレー/ネイビー/ベージュ）推奨")
-        comp = adjust_harmony(top_hex, "complement")[0]
-        if hex_family(comp) == hex_family(bottom_hex):
-            tips.append("補色の強対比 → 面積比7:3で調整（片方は小物化も◎）")
-        if season:
-            stips = {
-                "spring":"明るく軽やか（コーラル/ライム/ライトベージュ）",
-                "summer":"青み＆ソフト（ラベンダー/スモーキーブルー/グレージュ）",
-                "autumn":"深み＆黄み（テラコッタ/オリーブ/キャメル）",
-                "winter":"高コントラスト＆ビビッド（黒白/ロイヤルブルー等）"
-            }.get(season)
-            if stips: tips.append(stips)
-        if not tips:
-            tips.append("同系色の濃淡で大人っぽく（例：ネイビー×ライトブルー）")
-        return " / ".join(tips)
+    if st.button("保存する", key="prof_save"):
+        save_profile(season=None if season=="未設定" else season,
+                     body_shape=None if body_shape=="未設定" else body_shape,
+                     height_cm=float(height))
+        st.success("プロフィールを保存しました。AI提案に反映されます。")
 
-    def shape_advice(top_sil: str, bottom_sil: str) -> str:
-        pairs=[]
-        if top_sil=="オーバーサイズ": pairs.append("下は細め（スキニー/テーパード）でY字バランス◎")
-        if top_sil in ("クロップド/短丈","タイト/フィット"): pairs.append("ワイド/フレアやAラインで脚長見え")
-        if bottom_sil=="ワイド/フレア": pairs.append("上はコンパクト（短丈 or タイト）でA字を作る")
-        if bottom_sil=="スキニー/テーパード": pairs.append("上はボリューム（オーバー/レギュラー）でバランス")
-        if not pairs: pairs.append("上ゆる×下細で緩急をつけると締まります")
-        return " / ".join(pairs)
-
-    st.success(color_advice(top_color2, bottom_color2, profile.get("season")))
-    st.info(shape_advice(ts2, bs2))
-
-st.caption("※ 画像/URLからの取り込み・編集・共有に対応。全ウィジェットに一意な key を付与して重複IDを回避。")
+st.caption("※ use_container_width で警告解消 / URL取込は ZOZO/UNIQLO を含む多くのサイトの og:image/twitter:image/JSON-LD に対応。")
